@@ -5,9 +5,15 @@ def require_bearer_token(authorization: str | None = Header(default=None)) -> No
     """
     Requires: Authorization: Bearer <API_KEY>
     """
-    api_key = os.getenv("API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Server misconfiguration")
+api_key = (os.getenv("API_KEY") or "").strip()
+
+# If someone pasted the key with quotes in Render, remove them safely
+if (api_key.startswith('"') and api_key.endswith('"')) or (api_key.startswith("'") and api_key.endswith("'")):
+    api_key = api_key[1:-1].strip()
+
+if not api_key:
+    raise HTTPException(status_code=500, detail="Server misconfiguration")   
+)
 
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
