@@ -1,6 +1,8 @@
 from datetime import date
 from fastapi import Depends, FastAPI, Query
 
+import inspect
+from . import garmin_client
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_wellness
@@ -70,3 +72,10 @@ def auth_fingerprint(_auth: None = Depends(require_bearer_token)):
 
     fp = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
     return {"fingerprint": fp}
+
+@app.get("/debug_source")
+def debug_source():
+    return {
+        "garmin_client_file": garmin_client.__file__,
+        "fetch_activities_snippet": "\n".join(inspect.getsource(garmin_client.fetch_activities).splitlines()[:12]),
+    }
