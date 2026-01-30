@@ -56,3 +56,11 @@ def get_daily_summary(
         restingHr=d.restingHr if d else None,
         hrv=d.hrv if d else None,
     )
+
+@app.get("/")
+def root():
+    return {
+        "name": "garmin-gpt-bridge",
+        "status": "ok",
+        "endpoints": ["/health", "/version", "/activities", "/wellness", "/daily_summary"]
+    }
