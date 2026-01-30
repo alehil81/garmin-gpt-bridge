@@ -20,6 +20,10 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.get("/version")
+def version():
+    return {"version": "1.0.0"}
+
 @app.get("/activities", response_model=ActivitiesResponse)
 def get_activities(
     start: date = Query(...),
