@@ -1,20 +1,11 @@
 from datetime import date
 from fastapi import Depends, FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
 
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_wellness
 
 app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.get("/health")
 def health():
@@ -64,3 +55,18 @@ def root():
         "status": "ok",
         "endpoints": ["/health", "/version", "/activities", "/wellness", "/daily_summary"]
     }
+
+import os
+import hashlib
+
+@app.get("/auth_fingerprint")
+def auth_fingerprint(_auth: None = Depends(require_bearer_token)):
+    api_key = (os.getenv("API_KEY") or "").strip()
+    if (
+        (api_key.startswith('"') and api_key.endswith('"'))
+        or (api_key.startswith("'") and api_key.endswith("'"))
+    ):
+        api_key = api_key[1:-1].strip()
+
+    fp = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    return {"fingerprint": fp}
