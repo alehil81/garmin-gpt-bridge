@@ -3,12 +3,7 @@ from datetime import date, datetime
 from typing import List
 
 from garminconnect import Garmin
-from garminconnect.exceptions import (
-    GarminConnectAuthenticationError,
-    GarminConnectConnectionError,
-    GarminConnectTooManyRequestsError,
-)
-
+from fastapi import HTTPException
 from .models import Activity, WellnessDay
 
 
@@ -24,19 +19,27 @@ def _get_garmin_client() -> Garmin:
 
     os.makedirs(TOKEN_DIR, exist_ok=True)
 
-    client = Garmin(email=email, password=password)
+client = Garmin(email=email, password=password)
 
-    # Try token-based login first
+try:
     if os.path.exists(TOKEN_PATH):
         try:
             client.login(TOKEN_PATH)
             return client
         except Exception:
-            # Fall back to password login
             pass
 
-    # Password login, then save tokens
     client.login()
+    try:
+        client.garth.dump(TOKEN_PATH)
+    except Exception:
+        pass
+
+    return client
+
+except Exception as e:
+    # Surface a clean error to callers (and therefore to GPT)
+    raise HTTPException(status_code=502, detail=f"Garmin login failed: {type(e).__name__}")
     try:
         client.garth.dump(TOKEN_PATH)
     except Exception:
