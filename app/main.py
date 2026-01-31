@@ -92,3 +92,28 @@ def debug_env(_auth: None = Depends(require_bearer_token)):
         "len_oauth1_b64": len(b1) if b1 else 0,
         "len_oauth2_b64": len(b2) if b2 else 0,
     }
+
+from datetime import date
+from fastapi import Query, Depends
+from fastapi.responses import JSONResponse
+
+@app.get("/debug_sleep")
+def debug_sleep(
+    day: date = Query(...),
+    _auth: None = Depends(require_bearer_token),
+):
+    client = _get_garmin_client()
+
+    sleep = client.get_sleep_data(day.isoformat())
+    body = client.get_stats_and_body(day.isoformat())
+
+    try:
+        readiness = client.get_training_readiness(day.isoformat())
+    except Exception as e:
+        readiness = {"error": str(e)}
+
+    return JSONResponse({
+        "sleep": sleep,
+        "body": body,
+        "training_readiness": readiness,
+    })
