@@ -15,6 +15,20 @@ from .garmin_client import fetch_activities, fetch_wellness, _get_garmin_client
 
 app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
 
+from fastapi import Header
+
+@app.get("/debug_auth")
+def debug_auth(authorization: str | None = Header(default=None)):
+    # Don’t ever return the raw token
+    if not authorization:
+        return {"has_authorization_header": False}
+
+    return {
+        "has_authorization_header": True,
+        "starts_with_bearer": authorization.startswith("Bearer "),
+        "auth_length": len(authorization),
+        "auth_prefix": authorization[:12],  # e.g. "Bearer abc..."
+    }
 
 # -----------------------
 # Public endpoints
