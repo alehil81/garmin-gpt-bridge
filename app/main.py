@@ -134,3 +134,87 @@ def debug_sleep(
                 "error": str(e),
             },
         )
+
+    from datetime import date
+from fastapi import Depends, FastAPI, Query
+from fastapi.responses import JSONResponse
+
+from .auth import require_bearer_token
+from .garmin_client import _get_garmin_client
+
+@app.get("/sleep_summary")
+def sleep_summary(
+    day: date = Query(..., description="Wake-date (YYYY-MM-DD). Try the next day if empty."),
+    _auth: None = Depends(require_bearer_token),
+):
+    client = _get_garmin_client()
+    d = day.isoformat()
+
+    # Pull raw objects
+    sleep = client.get_sleep_data(d)
+    body = client.get_stats_and_body(d)
+
+    # --- Sleep score (best-effort; keys vary) ---
+    sleep_score = None
+    try:
+        sleep_score = (
+            sleep.get("sleepScores", {})
+                .get("overall", {})
+                .get("value")
+        )
+    except Exception:
+        pass
+
+    # --- Sleep duration + stages (best-effort) ---
+    sleeping_seconds = body.get("sleepingSeconds")
+    stages = sleep.get("sleepLevelsMap") or sleep.get("sleepLevelMap") or {}
+
+    # Common stage keys vary; try typical Garmin ones
+    deep_sec = stages.get("deepSleepSeconds") or stages.get("deepSeconds")
+    light_sec = stages.get("lightSleepSeconds") or stages.get("lightSeconds")
+    rem_sec = stages.get("remSleepSeconds") or stages.get("remSeconds")
+    awake_sec = stages.get("awakeSleepSeconds") or stages.get("awakeSeconds")
+
+    # --- HRV (you already saw it!) ---
+    avg_overnight_hrv = sleep.get("avgOvernightHrv")
+    hrv_status = sleep.get("hrvStatus")
+
+    # --- Body Battery (from daily body stats) ---
+    bb_during_sleep = body.get("bodyBatteryDuringSleep")
+    bb_at_wake = body.get("bodyBatteryAtWakeTime")
+    bb_high = body.get("bodyBatteryHighestValue")
+    bb_low = body.get("bodyBatteryLowestValue")
+
+    # --- Resting HR ---
+    resting_hr = body.get("restingHeartRate") or sleep.get("restingHeartRate")
+
+    # --- Training readiness (may not exist for all accounts/devices) ---
+    readiness = None
+    readiness_err = None
+    try:
+        readiness = client.get_training_readiness(d)
+    except Exception as e:
+        readiness_err = f"{type(e).__name__}: {str(e)}"
+
+    return JSONResponse({
+        "date": d,
+        "sleep_score": sleep_score,
+        "sleeping_seconds": sleeping_seconds,
+        "stages_seconds": {
+            "deep": deep_sec,
+            "light": light_sec,
+            "rem": rem_sec,
+            "awake": awake_sec,
+        },
+        "avg_overnight_hrv": avg_overnight_hrv,
+        "hrv_status": hrv_status,
+        "body_battery": {
+            "during_sleep": bb_during_sleep,
+            "at_wake": bb_at_wake,
+            "highest": bb_high,
+            "lowest": bb_low,
+        },
+        "resting_hr": resting_hr,
+        "training_readiness": readiness,
+        "training_readiness_error": readiness_err,
+    })
