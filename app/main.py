@@ -97,23 +97,40 @@ from datetime import date
 from fastapi import Query, Depends
 from fastapi.responses import JSONResponse
 
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+
 @app.get("/debug_sleep")
 def debug_sleep(
     day: date = Query(...),
     _auth: None = Depends(require_bearer_token),
 ):
-    client = _get_garmin_client()
-
-    sleep = client.get_sleep_data(day.isoformat())
-    body = client.get_stats_and_body(day.isoformat())
-
     try:
-        readiness = client.get_training_readiness(day.isoformat())
-    except Exception as e:
-        readiness = {"error": str(e)}
+        client = _get_garmin_client()
 
-    return JSONResponse({
-        "sleep": sleep,
-        "body": body,
-        "training_readiness": readiness,
-    })
+        sleep = client.get_sleep_data(day.isoformat())
+        body = client.get_stats_and_body(day.isoformat())
+
+        try:
+            readiness = client.get_training_readiness(day.isoformat())
+        except Exception as e:
+            readiness = {"error_type": type(e).__name__, "error": str(e)}
+
+        return JSONResponse({
+            "day": day.isoformat(),
+            "sleep_keys": list(sleep.keys()) if isinstance(sleep, dict) else str(type(sleep)),
+            "body_keys": list(body.keys()) if isinstance(body, dict) else str(type(body)),
+            "training_readiness": readiness,
+            "sleep": sleep,
+            "body": body,
+        })
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "where": "/debug_sleep",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            },
+        )
