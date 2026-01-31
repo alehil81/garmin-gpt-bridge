@@ -4,62 +4,77 @@ from datetime import date
 from typing import List
 
 from fastapi import HTTPException
-from garth import Client as GarthClient
 from garminconnect import Garmin
 
 from .models import Activity, WellnessDay
 
-GARTH_HOME = "/tmp/.garth"
-OAUTH1_PATH = os.path.join(GARTH_HOME, "oauth1_token.json")
-OAUTH2_PATH = os.path.join(GARTH_HOME, "oauth2_token.json")
+# Tokenstore directory on Render (ephemeral but fine for runtime)
+TOKENSTORE_DIR = "/tmp/.garth"
+OAUTH1_PATH = os.path.join(TOKENSTORE_DIR, "oauth1_token.json")
+OAUTH2_PATH = os.path.join(TOKENSTORE_DIR, "oauth2_token.json")
 
 
-def _ensure_garth_tokens_from_env() -> None:
+def _write_tokens_from_env_to_disk() -> None:
     """
-    Decode GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 into /tmp/.garth.
+    Decode GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 env vars and write them
+    into TOKENSTORE_DIR as oauth1_token.json / oauth2_token.json.
     """
     b1 = os.getenv("GARTH_OAUTH1_B64")
     b2 = os.getenv("GARTH_OAUTH2_B64")
-    if not b1 or not b2:
-        raise HTTPException(status_code=500, detail="Missing GARTH_OAUTH1_B64 or GARTH_OAUTH2_B64 env vars")
 
-    os.makedirs(GARTH_HOME, exist_ok=True)
+    if not b1 or not b2:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing GARTH_OAUTH1_B64 or GARTH_OAUTH2_B64 env vars",
+        )
+
+    os.makedirs(TOKENSTORE_DIR, exist_ok=True)
+
+    try:
+        oauth1_bytes = base64.b64decode(b1)
+        oauth2_bytes = base64.b64decode(b2)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed base64 decode of GARTH tokens: {type(e).__name__}",
+        )
 
     try:
         with open(OAUTH1_PATH, "wb") as f:
-            f.write(base64.b64decode(b1))
+            f.write(oauth1_bytes)
         with open(OAUTH2_PATH, "wb") as f:
-            f.write(base64.b64decode(b2))
+            f.write(oauth2_bytes)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed decoding GARTH tokens: {type(e).__name__}")
-
-    # Make sure garth reads from our directory
-    os.environ["GARTH_HOME"] = GARTH_HOME
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed writing token files: {type(e).__name__}",
+        )
 
 
 def _get_garmin_client() -> Garmin:
     """
-    Build a Garmin client that uses already-authenticated garth tokens.
-    No email/password login. No MFA prompts.
+    Create a Garmin client and authenticate using tokenstore directory.
+    This avoids email/password login (and avoids repeated MFA prompts).
     """
-    _ensure_garth_tokens_from_env()
+    _write_tokens_from_env_to_disk()
 
     try:
-        g = GarthClient()
-        g.load(GARTH_HOME)  # reads oauth1_token.json + oauth2_token.json
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Garth token load failed: {type(e).__name__}")
-
-    try:
-        client = Garmin(garth=g)
-        # Force a lightweight call to confirm tokens are valid (avoids silent failures)
-        _ = g.profile
+        client = Garmin()  # no username/password
+        # IMPORTANT: tokenstore must be a DIRECTORY containing oauth1/2 json files
+        client.login(TOKENSTORE_DIR)
         return client
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Garmin token client init failed: {type(e).__name__}")
+        # Most common: GarminConnectConnectionError / AuthenticationError / TooManyRequests
+        raise HTTPException(
+            status_code=502,
+            detail=f"Garmin token login failed: {type(e).__name__}",
+        )
 
 
 def fetch_activities(start: date, end: date) -> List[Activity]:
+    """
+    Fetch activities between start and end (inclusive).
+    """
     client = _get_garmin_client()
 
     seen = set()
@@ -70,9 +85,12 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
         try:
             acts = client.get_activities_by_date(day.isoformat())
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Garmin activities fetch failed: {type(e).__name__}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Garmin activities fetch failed: {type(e).__name__}",
+            )
 
-        for a in acts:
+        for a in acts or []:
             activity_id = a.get("activityId")
             if activity_id in seen:
                 continue
@@ -98,6 +116,9 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
 
 
 def fetch_wellness(start: date, end: date) -> List[WellnessDay]:
+    """
+    Fetch wellness summary metrics by day.
+    """
     client = _get_garmin_client()
     results: List[WellnessDay] = []
 
@@ -108,7 +129,10 @@ def fetch_wellness(start: date, end: date) -> List[WellnessDay]:
         try:
             daily = client.get_stats_and_body(d)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Garmin wellness fetch failed: {type(e).__name__}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Garmin wellness fetch failed: {type(e).__name__}",
+            )
 
         resting_hr = daily.get("restingHeartRate")
         hrv = daily.get("hrvValue") or daily.get("hrvWeeklyAvg") or daily.get("hrv")
@@ -120,7 +144,10 @@ def fetch_wellness(start: date, end: date) -> List[WellnessDay]:
         except Exception:
             pass
 
-        body_battery = daily.get("bodyBattery", {}).get("bodyBatteryMax") or daily.get("bodyBatteryMax")
+        body_battery = (
+            (daily.get("bodyBattery", {}) or {}).get("bodyBatteryMax")
+            or daily.get("bodyBatteryMax")
+        )
 
         results.append(
             WellnessDay(
