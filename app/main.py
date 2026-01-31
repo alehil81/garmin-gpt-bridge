@@ -79,3 +79,16 @@ def debug_source():
         "garmin_client_file": garmin_client.__file__,
         "fetch_activities_snippet": "\n".join(inspect.getsource(garmin_client.fetch_activities).splitlines()[:12]),
     }
+
+import os
+
+@app.get("/debug_env")
+def debug_env(_auth: None = Depends(require_bearer_token)):
+    b1 = os.getenv("GARTH_OAUTH1_B64")
+    b2 = os.getenv("GARTH_OAUTH2_B64")
+    return {
+        "has_oauth1_b64": bool(b1),
+        "has_oauth2_b64": bool(b2),
+        "len_oauth1_b64": len(b1) if b1 else 0,
+        "len_oauth2_b64": len(b2) if b2 else 0,
+    }
