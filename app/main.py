@@ -30,6 +30,13 @@ def debug_auth(authorization: str | None = Header(default=None)):
         "auth_prefix": authorization[:12],  # e.g. "Bearer abc..."
     }
 
+from fastapi import Depends
+from .auth import require_bearer_token
+
+@app.get("/debug_auth")
+def debug_auth(_auth: None = Depends(require_bearer_token)):
+    return {"ok": True, "msg": "auth passed"}
+
 # -----------------------
 # Public endpoints
 # -----------------------
