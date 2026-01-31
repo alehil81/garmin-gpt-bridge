@@ -64,16 +64,34 @@ def _get_garmin_client() -> Garmin:
         client.login(TOKENSTORE_DIR)
         return client
     except Exception as e:
-        # Most common: GarminConnectConnectionError / AuthenticationError / TooManyRequests
         raise HTTPException(
             status_code=502,
             detail=f"Garmin token login failed: {type(e).__name__}",
         )
 
 
+def _activity_in_range(ts: str, start: date, end: date) -> bool:
+    """
+    Best-effort: Determine whether an activity timestamp is within [start, end].
+    Garmin commonly returns 'YYYY-MM-DD HH:MM:SS' or similar strings.
+    """
+    if not ts:
+        return False
+
+    # Most common: "2026-01-01 13:05:13"
+    try:
+        act_date = ts.split(" ")[0]  # "YYYY-MM-DD"
+        return start.isoformat() <= act_date <= end.isoformat()
+    except Exception:
+        # If parsing fails, keep it rather than accidentally dropping valid data
+        return True
+
+
 def fetch_activities(start: date, end: date) -> List[Activity]:
     """
     Fetch activities between start and end (inclusive).
+    NOTE: Garmin sometimes returns activities outside a single requested day,
+    so we locally filter by date range.
     """
     client = _get_garmin_client()
 
@@ -91,6 +109,11 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
             )
 
         for a in acts or []:
+            # Prefer local time; fallback to GMT
+            ts = a.get("startTimeLocal") or a.get("startTimeGMT") or ""
+            if not _activity_in_range(ts, start, end):
+                continue
+
             activity_id = a.get("activityId")
             if activity_id in seen:
                 continue
@@ -99,7 +122,7 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
             results.append(
                 Activity(
                     activityId=str(activity_id) if activity_id is not None else None,
-                    startTime=a.get("startTimeLocal") or a.get("startTimeGMT"),
+                    startTime=ts,
                     type=(a.get("activityType", {}) or {}).get("typeKey"),
                     durationSec=a.get("duration"),
                     distanceM=a.get("distance"),
