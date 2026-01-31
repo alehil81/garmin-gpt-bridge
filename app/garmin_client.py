@@ -4,7 +4,7 @@ from datetime import date
 from typing import List
 
 from fastapi import HTTPException
-
+from garth import Client as GarthClient
 from garminconnect import Garmin
 
 from .models import Activity, WellnessDay
@@ -14,16 +14,14 @@ OAUTH1_PATH = os.path.join(GARTH_HOME, "oauth1_token.json")
 OAUTH2_PATH = os.path.join(GARTH_HOME, "oauth2_token.json")
 
 
-def _write_tokens_from_env() -> bool:
+def _ensure_garth_tokens_from_env() -> None:
     """
-    If GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 are present, decode and write them
-    into /tmp/.garth so garminconnect/garth can use them.
-    Returns True if tokens were written.
+    Decode GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 into /tmp/.garth.
     """
     b1 = os.getenv("GARTH_OAUTH1_B64")
     b2 = os.getenv("GARTH_OAUTH2_B64")
     if not b1 or not b2:
-        return False
+        raise HTTPException(status_code=500, detail="Missing GARTH_OAUTH1_B64 or GARTH_OAUTH2_B64 env vars")
 
     os.makedirs(GARTH_HOME, exist_ok=True)
 
@@ -33,44 +31,32 @@ def _write_tokens_from_env() -> bool:
         with open(OAUTH2_PATH, "wb") as f:
             f.write(base64.b64decode(b2))
     except Exception as e:
-        raise RuntimeError(f"Failed to decode/write GARTH tokens: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail=f"Failed decoding GARTH tokens: {type(e).__name__}")
 
-    # Important: tell garth where to look
+    # Make sure garth reads from our directory
     os.environ["GARTH_HOME"] = GARTH_HOME
-    return True
 
 
 def _get_garmin_client() -> Garmin:
     """
-    Prefer token-based auth via GARTH_OAUTH1_B64 / GARTH_OAUTH2_B64.
-    Fall back to email/password only if tokens are not provided.
+    Build a Garmin client that uses already-authenticated garth tokens.
+    No email/password login. No MFA prompts.
     """
-    have_tokens = _write_tokens_from_env()
-
-    email = os.getenv("GARMIN_EMAIL")
-    password = os.getenv("GARMIN_PASSWORD")
-
-    # Create client (email/password optional when token-based works)
-    client = Garmin(email=email, password=password)
-
-    # Token-based path
-    if have_tokens:
-        try:
-            # garminconnect uses garth under the hood; this should load tokens from GARTH_HOME
-            client.login()
-            return client
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Garmin token login failed: {type(e).__name__}")
-
-    # Fallback path (only if you set GARMIN_EMAIL/PASSWORD)
-    if not email or not password:
-        raise HTTPException(status_code=500, detail="Missing GARTH_OAUTH*_B64 tokens and missing GARMIN_EMAIL/GARMIN_PASSWORD")
+    _ensure_garth_tokens_from_env()
 
     try:
-        client.login()
+        g = GarthClient()
+        g.load(GARTH_HOME)  # reads oauth1_token.json + oauth2_token.json
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Garth token load failed: {type(e).__name__}")
+
+    try:
+        client = Garmin(garth=g)
+        # Force a lightweight call to confirm tokens are valid (avoids silent failures)
+        _ = g.profile
         return client
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Garmin password login failed: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail=f"Garmin token client init failed: {type(e).__name__}")
 
 
 def fetch_activities(start: date, end: date) -> List[Activity]:
