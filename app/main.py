@@ -1,21 +1,75 @@
-from datetime import date
-from fastapi import Depends, FastAPI, Query
+from __future__ import annotations
 
+from datetime import date
+import os
+import hashlib
 import inspect
-from . import garmin_client
+from typing import Any, Dict, Optional
+
+from fastapi import Depends, FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
+
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_wellness, _get_garmin_client
+
 app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
 
+
+# -----------------------
+# Public endpoints
+# -----------------------
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/version")
 def version():
     return {"version": "1.0.0"}
 
+
+@app.get("/")
+def root():
+    return {
+        "name": "garmin-gpt-bridge",
+        "status": "ok",
+        "endpoints": [
+            "/",
+            "/health",
+            "/version",
+            "/auth_fingerprint",
+            "/activities",
+            "/wellness",
+            "/daily_summary",
+            "/sleep_summary",
+            "/debug_env",
+            "/debug_source",
+            "/debug_sleep",
+        ],
+    }
+
+
+# -----------------------
+# Auth debug (protected)
+# -----------------------
+@app.get("/auth_fingerprint")
+def auth_fingerprint(_auth: None = Depends(require_bearer_token)):
+    api_key = (os.getenv("API_KEY") or "").strip()
+
+    # Strip accidental quotes if user pasted them into Render
+    if (api_key.startswith('"') and api_key.endswith('"')) or (
+        api_key.startswith("'") and api_key.endswith("'")
+    ):
+        api_key = api_key[1:-1].strip()
+
+    fp = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12] if api_key else ""
+    return {"fingerprint": fp}
+
+
+# -----------------------
+# Core endpoints (protected)
+# -----------------------
 @app.get("/activities", response_model=ActivitiesResponse)
 def get_activities(
     start: date = Query(...),
@@ -25,6 +79,7 @@ def get_activities(
     acts = fetch_activities(start, end)
     return ActivitiesResponse(activities=acts)
 
+
 @app.get("/wellness", response_model=WellnessResponse)
 def get_wellness(
     start: date = Query(...),
@@ -33,6 +88,7 @@ def get_wellness(
 ):
     days = fetch_wellness(start, end)
     return WellnessResponse(days=days)
+
 
 @app.get("/daily_summary", response_model=DailySummaryResponse)
 def get_daily_summary(
@@ -49,81 +105,85 @@ def get_daily_summary(
         hrv=d.hrv if d else None,
     )
 
-@app.get("/")
-def root():
-    return {
-        "name": "garmin-gpt-bridge",
-        "status": "ok",
-        "endpoints": ["/health", "/version", "/activities", "/wellness", "/daily_summary"]
-    }
 
-import os
-import hashlib
-
-@app.get("/auth_fingerprint")
-def auth_fingerprint(_auth: None = Depends(require_bearer_token)):
-    api_key = (os.getenv("API_KEY") or "").strip()
-    if (
-        (api_key.startswith('"') and api_key.endswith('"'))
-        or (api_key.startswith("'") and api_key.endswith("'"))
-    ):
-        api_key = api_key[1:-1].strip()
-
-    fp = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
-    return {"fingerprint": fp}
-
-@app.get("/debug_source")
-def debug_source():
-    return {
-        "garmin_client_file": garmin_client.__file__,
-        "fetch_activities_snippet": "\n".join(inspect.getsource(garmin_client.fetch_activities).splitlines()[:12]),
-    }
-
-import os
-
+# -----------------------
+# Debug helpers (protected)
+# -----------------------
 @app.get("/debug_env")
 def debug_env(_auth: None = Depends(require_bearer_token)):
-    b1 = os.getenv("GARTH_OAUTH1_B64")
-    b2 = os.getenv("GARTH_OAUTH2_B64")
+    # Safe: only reports whether variables exist + lengths
+    def _val(name: str) -> str:
+        return (os.getenv(name) or "").strip()
+
+    api = _val("API_KEY")
+    g1 = _val("GARMIN_OAUTH1_B64")
+    g2 = _val("GARMIN_OAUTH2_B64")
+    email = _val("GARMIN_EMAIL")
+    pwd = _val("GARMIN_PASSWORD")
+
     return {
-        "has_oauth1_b64": bool(b1),
-        "has_oauth2_b64": bool(b2),
-        "len_oauth1_b64": len(b1) if b1 else 0,
-        "len_oauth2_b64": len(b2) if b2 else 0,
+        "has_api_key": bool(api),
+        "len_api_key": len(api),
+        "has_oauth1_b64": bool(g1),
+        "has_oauth2_b64": bool(g2),
+        "len_oauth1_b64": len(g1),
+        "len_oauth2_b64": len(g2),
+        "has_garmin_email": bool(email),
+        "has_garmin_password": bool(pwd),
     }
 
-from datetime import date
-from fastapi import Query, Depends
-from fastapi.responses import JSONResponse
 
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse
+@app.get("/debug_source")
+def debug_source(_auth: None = Depends(require_bearer_token)):
+    # Shows which code is deployed (helps cache/debug)
+    try:
+        src = inspect.getsource(fetch_activities)
+    except Exception:
+        src = "<could not read source>"
+    try:
+        import app.garmin_client as gc  # type: ignore
+        file_path = getattr(gc, "__file__", None)
+    except Exception:
+        file_path = None
+    return {
+        "garmin_client_file": file_path,
+        "fetch_activities_snippet": (src[:900] + "...") if isinstance(src, str) else str(src),
+    }
+
 
 @app.get("/debug_sleep")
 def debug_sleep(
     day: date = Query(...),
     _auth: None = Depends(require_bearer_token),
 ):
+    """
+    Raw Garmin responses for one day.
+    NOTE: This can be large.
+    """
     try:
         client = _get_garmin_client()
-
         sleep = client.get_sleep_data(day.isoformat())
         body = client.get_stats_and_body(day.isoformat())
-
         try:
             readiness = client.get_training_readiness(day.isoformat())
         except Exception as e:
-            readiness = {"error_type": type(e).__name__, "error": str(e)}
+            readiness = None
+            readiness_error = f"{type(e).__name__}: {e}"
+        else:
+            readiness_error = None
 
-        return JSONResponse({
-            "day": day.isoformat(),
-            "sleep_keys": list(sleep.keys()) if isinstance(sleep, dict) else str(type(sleep)),
-            "body_keys": list(body.keys()) if isinstance(body, dict) else str(type(body)),
-            "training_readiness": readiness,
-            "sleep": sleep,
-            "body": body,
-        })
-
+        # return keys too so you can see shape quickly
+        sleep_keys = list(sleep.keys()) if isinstance(sleep, dict) else []
+        return JSONResponse(
+            {
+                "day": day.isoformat(),
+                "sleep_keys": sleep_keys,
+                "sleep": sleep,
+                "body": body,
+                "training_readiness": readiness,
+                "training_readiness_error": readiness_error,
+            }
+        )
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -134,86 +194,114 @@ def debug_sleep(
             },
         )
 
-    from datetime import date
-from fastapi import Depends, FastAPI, Query
-from fastapi.responses import JSONResponse
 
-from .auth import require_bearer_token
-from .garmin_client import _get_garmin_client
-
+# -----------------------
+# Sleep summary (protected)
+# -----------------------
 @app.get("/sleep_summary")
 def sleep_summary(
-    day: date = Query(..., description="Wake-date (YYYY-MM-DD). Try the next day if empty."),
+    day: date = Query(...),
     _auth: None = Depends(require_bearer_token),
 ):
-    client = _get_garmin_client()
-    d = day.isoformat()
-
-    # Pull raw objects
-    sleep = client.get_sleep_data(d)
-    body = client.get_stats_and_body(d)
-
-    # --- Sleep score (best-effort; keys vary) ---
-    sleep_score = None
+    """
+    Compact sleep summary for a day:
+    - sleep score (overall)
+    - sleep time (seconds)
+    - stages seconds (deep/light/rem/awake)
+    - avg overnight HRV + status (if present)
+    - body battery during sleep + at wake + highest/lowest (if present)
+    - resting HR (if present)
+    - training readiness (if available)
+    """
     try:
-        sleep_score = (
-            sleep.get("sleepScores", {})
-                .get("overall", {})
-                .get("value")
-        )
-    except Exception:
-        pass
+        client = _get_garmin_client()
+        sleep = client.get_sleep_data(day.isoformat())
+        body = client.get_stats_and_body(day.isoformat())
 
-    # --- Sleep duration + stages (best-effort) ---
-    sleeping_seconds = body.get("sleepingSeconds")
-    stages = sleep.get("sleepLevelsMap") or sleep.get("sleepLevelMap") or {}
+        # Training readiness
+        try:
+            readiness = client.get_training_readiness(day.isoformat())
+            readiness_error = None
+        except Exception as e:
+            readiness = None
+            readiness_error = f"{type(e).__name__}: {e}"
 
-    # Common stage keys vary; try typical Garmin ones
-    deep_sec = stages.get("deepSleepSeconds") or stages.get("deepSeconds")
-    light_sec = stages.get("lightSleepSeconds") or stages.get("lightSeconds")
-    rem_sec = stages.get("remSleepSeconds") or stages.get("remSeconds")
-    awake_sec = stages.get("awakeSleepSeconds") or stages.get("awakeSeconds")
+        # ---- Robustly locate dailySleepDTO (handles multiple shapes) ----
+        dto: Dict[str, Any] = {}
+        if isinstance(sleep, dict):
+            if isinstance(sleep.get("dailySleepDTO"), dict):
+                dto = sleep["dailySleepDTO"]
+            elif isinstance(sleep.get("sleep"), dict) and isinstance(sleep["sleep"].get("dailySleepDTO"), dict):
+                dto = sleep["sleep"]["dailySleepDTO"]
 
-    # --- HRV (you already saw it!) ---
-    avg_overnight_hrv = sleep.get("avgOvernightHrv")
-    hrv_status = sleep.get("hrvStatus")
+        # Sleep score
+        sleep_scores = dto.get("sleepScores") if isinstance(dto, dict) else None
+        sleep_score = None
+        if isinstance(sleep_scores, dict):
+            overall = sleep_scores.get("overall")
+            if isinstance(overall, dict):
+                sleep_score = overall.get("value")
 
-    # --- Body Battery (from daily body stats) ---
-    bb_during_sleep = body.get("bodyBatteryDuringSleep")
-    bb_at_wake = body.get("bodyBatteryAtWakeTime")
-    bb_high = body.get("bodyBatteryHighestValue")
-    bb_low = body.get("bodyBatteryLowestValue")
+        # Sleep seconds
+        sleeping_seconds = dto.get("sleepTimeSeconds") if isinstance(dto, dict) else None
+        if sleeping_seconds is None and isinstance(body, dict):
+            sleeping_seconds = body.get("sleepingSeconds")
 
-    # --- Resting HR ---
-    resting_hr = body.get("restingHeartRate") or sleep.get("restingHeartRate")
+        # Stages seconds (most reliable from dailySleepDTO)
+        stages_seconds = {
+            "deep": dto.get("deepSleepSeconds") if isinstance(dto, dict) else None,
+            "light": dto.get("lightSleepSeconds") if isinstance(dto, dict) else None,
+            "rem": dto.get("remSleepSeconds") if isinstance(dto, dict) else None,
+            "awake": dto.get("awakeSleepSeconds") if isinstance(dto, dict) else None,
+        }
 
-    # --- Training readiness (may not exist for all accounts/devices) ---
-    readiness = None
-    readiness_err = None
-    try:
-        readiness = client.get_training_readiness(d)
+        # HRV: can live in different places depending on Garmin payload
+        avg_overnight_hrv = None
+        hrv_status = None
+        if isinstance(sleep, dict):
+            # Sometimes at top-level in sleep response
+            avg_overnight_hrv = sleep.get("avgOvernightHrv") or sleep.get("avg_overnight_hrv")
+            hrv_status = sleep.get("hrvStatus") or sleep.get("hrv_status")
+            # Sometimes nested inside sleep["sleep"]
+            if avg_overnight_hrv is None and isinstance(sleep.get("sleep"), dict):
+                avg_overnight_hrv = sleep["sleep"].get("avgOvernightHrv") or sleep["sleep"].get("avg_overnight_hrv")
+            if hrv_status is None and isinstance(sleep.get("sleep"), dict):
+                hrv_status = sleep["sleep"].get("hrvStatus") or sleep["sleep"].get("hrv_status")
+
+        # Body Battery: best effort from body daily stats
+        body_battery = {
+            "during_sleep": None,
+            "at_wake": None,
+            "highest": None,
+            "lowest": None,
+        }
+        if isinstance(body, dict):
+            body_battery["during_sleep"] = body.get("bodyBatteryDuringSleep")
+            body_battery["at_wake"] = body.get("bodyBatteryAtWakeTime")
+            body_battery["highest"] = body.get("bodyBatteryHighestValue")
+            body_battery["lowest"] = body.get("bodyBatteryLowestValue")
+
+        resting_hr = body.get("restingHeartRate") if isinstance(body, dict) else None
+
+        return {
+            "date": day.isoformat(),
+            "sleep_score": sleep_score,
+            "sleeping_seconds": sleeping_seconds,
+            "stages_seconds": stages_seconds,
+            "avg_overnight_hrv": avg_overnight_hrv,
+            "hrv_status": hrv_status,
+            "body_battery": body_battery,
+            "resting_hr": resting_hr,
+            "training_readiness": readiness,
+            "training_readiness_error": readiness_error,
+        }
+
     except Exception as e:
-        readiness_err = f"{type(e).__name__}: {str(e)}"
-
-    return JSONResponse({
-        "date": d,
-        "sleep_score": sleep_score,
-        "sleeping_seconds": sleeping_seconds,
-        "stages_seconds": {
-            "deep": deep_sec,
-            "light": light_sec,
-            "rem": rem_sec,
-            "awake": awake_sec,
-        },
-        "avg_overnight_hrv": avg_overnight_hrv,
-        "hrv_status": hrv_status,
-        "body_battery": {
-            "during_sleep": bb_during_sleep,
-            "at_wake": bb_at_wake,
-            "highest": bb_high,
-            "lowest": bb_low,
-        },
-        "resting_hr": resting_hr,
-        "training_readiness": readiness,
-        "training_readiness_error": readiness_err,
-    })
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "where": "/sleep_summary",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            },
+        )
