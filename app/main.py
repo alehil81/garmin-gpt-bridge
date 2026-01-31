@@ -6,7 +6,6 @@ from . import garmin_client
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_wellness, _get_garmin_client
-
 app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
 
 @app.get("/health")
