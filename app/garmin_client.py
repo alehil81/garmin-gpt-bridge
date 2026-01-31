@@ -1,52 +1,76 @@
 import os
+import base64
 from datetime import date
 from typing import List
 
 from fastapi import HTTPException
+
 from garminconnect import Garmin
 
 from .models import Activity, WellnessDay
 
-TOKEN_DIR = "/tmp/garminconnect"
-TOKEN_PATH = os.path.join(TOKEN_DIR, "tokens.json")
+GARTH_HOME = "/tmp/.garth"
+OAUTH1_PATH = os.path.join(GARTH_HOME, "oauth1_token.json")
+OAUTH2_PATH = os.path.join(GARTH_HOME, "oauth2_token.json")
+
+
+def _write_tokens_from_env() -> bool:
+    """
+    If GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 are present, decode and write them
+    into /tmp/.garth so garminconnect/garth can use them.
+    Returns True if tokens were written.
+    """
+    b1 = os.getenv("GARTH_OAUTH1_B64")
+    b2 = os.getenv("GARTH_OAUTH2_B64")
+    if not b1 or not b2:
+        return False
+
+    os.makedirs(GARTH_HOME, exist_ok=True)
+
+    try:
+        with open(OAUTH1_PATH, "wb") as f:
+            f.write(base64.b64decode(b1))
+        with open(OAUTH2_PATH, "wb") as f:
+            f.write(base64.b64decode(b2))
+    except Exception as e:
+        raise RuntimeError(f"Failed to decode/write GARTH tokens: {type(e).__name__}")
+
+    # Important: tell garth where to look
+    os.environ["GARTH_HOME"] = GARTH_HOME
+    return True
 
 
 def _get_garmin_client() -> Garmin:
-    email = (os.getenv("GARMIN_EMAIL") or "").strip()
-    password = (os.getenv("GARMIN_PASSWORD") or "").strip()
+    """
+    Prefer token-based auth via GARTH_OAUTH1_B64 / GARTH_OAUTH2_B64.
+    Fall back to email/password only if tokens are not provided.
+    """
+    have_tokens = _write_tokens_from_env()
 
-    if not email or not password:
-        raise HTTPException(status_code=500, detail="Missing GARMIN_EMAIL or GARMIN_PASSWORD env vars")
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
 
-    os.makedirs(TOKEN_DIR, exist_ok=True)
-
+    # Create client (email/password optional when token-based works)
     client = Garmin(email=email, password=password)
 
-    try:
-        # Try token-based login first (preferred)
-        if os.path.exists(TOKEN_PATH):
-            try:
-                client.login(TOKEN_PATH)
-                return client
-            except Exception:
-                # Fall back to password login
-                pass
-
-        # Password login (may trigger MFA depending on account)
-        client.login()
-
-        # Save tokens for next time (best-effort)
+    # Token-based path
+    if have_tokens:
         try:
-            # Some versions use client.garth.dump; if not available, ignore
-            if hasattr(client, "garth") and hasattr(client.garth, "dump"):
-                client.garth.dump(TOKEN_PATH)
-        except Exception:
-            pass
+            # garminconnect uses garth under the hood; this should load tokens from GARTH_HOME
+            client.login()
+            return client
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Garmin token login failed: {type(e).__name__}")
 
+    # Fallback path (only if you set GARMIN_EMAIL/PASSWORD)
+    if not email or not password:
+        raise HTTPException(status_code=500, detail="Missing GARTH_OAUTH*_B64 tokens and missing GARMIN_EMAIL/GARMIN_PASSWORD")
+
+    try:
+        client.login()
         return client
-
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Garmin login failed: {type(e).__name__}")
+        raise HTTPException(status_code=502, detail=f"Garmin password login failed: {type(e).__name__}")
 
 
 def fetch_activities(start: date, end: date) -> List[Activity]:
@@ -62,7 +86,7 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Garmin activities fetch failed: {type(e).__name__}")
 
-        for a in acts or []:
+        for a in acts:
             activity_id = a.get("activityId")
             if activity_id in seen:
                 continue
@@ -89,10 +113,9 @@ def fetch_activities(start: date, end: date) -> List[Activity]:
 
 def fetch_wellness(start: date, end: date) -> List[WellnessDay]:
     client = _get_garmin_client()
-
     results: List[WellnessDay] = []
-    day = start
 
+    day = start
     while day <= end:
         d = day.isoformat()
 
