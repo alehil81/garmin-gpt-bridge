@@ -185,3 +185,160 @@ def fetch_wellness(start: date, end: date) -> List[WellnessDay]:
         day = date.fromordinal(day.toordinal() + 1)
 
     return results
+
+from datetime import timedelta
+
+def _safe_get(d: dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur is None:
+            return default
+    return cur
+
+def extract_sleep_metrics_for_day(client: Garmin, day: date) -> dict:
+    """
+    Returns compact sleep+HRV+BB+readiness metrics for a day.
+    Safe against missing keys / device differences.
+    """
+    d = day.isoformat()
+
+    sleep = client.get_sleep_data(d) or {}
+    body = client.get_stats_and_body(d) or {}
+
+    # Training readiness (may not exist for all devices/accounts)
+    readiness = None
+    readiness_error = None
+    try:
+        readiness = client.get_training_readiness(d)
+    except Exception as e:
+        readiness_error = f"{type(e).__name__}: {e}"
+
+    dto = sleep.get("dailySleepDTO") or {}
+    sleep_scores = dto.get("sleepScores") or {}
+    overall_score = _safe_get(sleep_scores, "overall", "value")
+
+    # Stages (seconds) — most reliable via dailySleepDTO
+    stages = {
+        "deep": dto.get("deepSleepSeconds"),
+        "light": dto.get("lightSleepSeconds"),
+        "rem": dto.get("remSleepSeconds"),
+        "awake": dto.get("awakeSleepSeconds"),
+    }
+
+    # Total sleeping seconds — body has sleepingSeconds; dto has sleepTimeSeconds
+    sleeping_seconds = body.get("sleepingSeconds")
+    if sleeping_seconds is None:
+        sleeping_seconds = dto.get("sleepTimeSeconds")
+
+    # Overnight HRV — sometimes inside sleep payload in different places
+    avg_overnight_hrv = (
+        sleep.get("avgOvernightHrv")
+        or sleep.get("avgOvernightHRV")
+        or _safe_get(sleep, "wellnessSpO2SleepSummaryDTO", "avgOvernightHrv")
+        or dto.get("avgOvernightHrv")
+    )
+
+    hrv_status = sleep.get("hrvStatus") or dto.get("hrvStatus")
+
+    # Body Battery key values (best effort)
+    bb = {
+        "during_sleep": body.get("bodyBatteryDuringSleep"),
+        "at_wake": body.get("bodyBatteryAtWakeTime"),
+        "highest": body.get("bodyBatteryHighestValue"),
+        "lowest": body.get("bodyBatteryLowestValue"),
+    }
+
+    resting_hr = body.get("restingHeartRate") or dto.get("restingHeartRate")
+
+    # Readiness score: readiness sometimes comes as list; keep list but also pick a “best” score
+    best_readiness_score = None
+    best_readiness_level = None
+    if isinstance(readiness, list) and readiness:
+        # Prefer AFTER_WAKEUP_RESET if present; else last entry
+        pick = None
+        for r in readiness:
+            if (r or {}).get("inputContext") == "AFTER_WAKEUP_RESET":
+                pick = r
+                break
+        if pick is None:
+            pick = readiness[-1]
+        best_readiness_score = (pick or {}).get("score")
+        best_readiness_level = (pick or {}).get("level")
+
+    return {
+        "date": d,
+        "sleep_score": overall_score,
+        "sleeping_seconds": sleeping_seconds,
+        "stages_seconds": stages,
+        "avg_overnight_hrv": avg_overnight_hrv,
+        "hrv_status": hrv_status,
+        "body_battery": bb,
+        "resting_hr": resting_hr,
+        "training_readiness": readiness,
+        "training_readiness_score": best_readiness_score,
+        "training_readiness_level": best_readiness_level,
+        "training_readiness_error": readiness_error,
+    }
+
+from datetime import date, timedelta
+from typing import List, Dict, Any
+
+
+def fetch_sleep_range(start: date, end: date) -> List[Dict[str, Any]]:
+    """
+    Fetch sleep + recovery metrics for each day in [start, end].
+    Returns one dict per night.
+    """
+    client = _get_garmin_client()
+    results: List[Dict[str, Any]] = []
+
+    day = start
+    while day <= end:
+        day_str = day.isoformat()
+
+        try:
+            sleep = client.get_sleep_data(day_str)
+            body = client.get_stats_and_body(day_str)
+            readiness = client.get_training_readiness(day_str)
+        except Exception:
+            # Skip days Garmin does not have data for
+            day += timedelta(days=1)
+            continue
+
+        dto = (sleep or {}).get("dailySleepDTO", {})
+        scores = dto.get("sleepScores", {}) if isinstance(dto.get("sleepScores"), dict) else {}
+
+        results.append({
+            "date": day_str,
+
+            # ---- Sleep ----
+            "sleep_score": scores.get("overall", {}).get("value"),
+            "sleep_seconds": dto.get("sleepTimeSeconds"),
+            "deep_seconds": dto.get("deepSleepSeconds"),
+            "light_seconds": dto.get("lightSleepSeconds"),
+            "rem_seconds": dto.get("remSleepSeconds"),
+            "awake_seconds": dto.get("awakeSleepSeconds"),
+
+            # ---- HRV ----
+            "avg_overnight_hrv": sleep.get("avgOvernightHrv"),
+            "hrv_status": sleep.get("hrvStatus"),
+
+            # ---- Resting HR ----
+            "resting_hr": body.get("restingHeartRate"),
+
+            # ---- Body Battery ----
+            "body_battery_at_wake": body.get("bodyBatteryAtWakeTime"),
+            "body_battery_during_sleep": body.get("bodyBatteryDuringSleep"),
+            "body_battery_highest": body.get("bodyBatteryHighestValue"),
+            "body_battery_lowest": body.get("bodyBatteryLowestValue"),
+
+            # ---- Training Readiness ----
+            "training_readiness": readiness,
+        })
+
+        day += timedelta(days=1)
+
+    return results
