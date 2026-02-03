@@ -342,3 +342,99 @@ def fetch_sleep_range(start: date, end: date) -> List[Dict[str, Any]]:
         day += timedelta(days=1)
 
     return results
+
+# -----------------------
+# Activity zones helpers
+# -----------------------
+from typing import Dict, Any, Optional
+import re
+
+
+def _extract_time_in_zones(details: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Best-effort extraction of time-in-zone seconds from Garmin activity details payload.
+
+    Returns keys like:
+      hr_z1_sec..hr_z5_sec
+      pwr_z1_sec..pwr_z7_sec   (some profiles have 7 power zones)
+    Values are seconds (float) or None if not found.
+    """
+    out: Dict[str, Optional[float]] = {}
+
+    # Common patterns seen in Garmin payloads vary by device/account.
+    # We'll scan the entire dict for keys that look like time-in-zone.
+    for k, v in (details or {}).items():
+        if v is None:
+            continue
+        if not isinstance(v, (int, float)):
+            continue
+
+        key = str(k)
+
+        # Examples we try to support:
+        # timeInHrZone1, timeInHrZone_1, timeInHRZone1, hrZone1Seconds, etc.
+        m = re.match(r"(?i)^time(in)?hrzone[_]?(\d+)$", key) or re.match(
+            r"(?i)^hrzone[_]?(\d+)(seconds|sec)?$", key
+        )
+        if m:
+            # m groups may differ depending on which regex matched
+            zone_num = m.group(2) if len(m.groups()) >= 2 and m.group(2) else m.group(1)
+            try:
+                zn = int(zone_num)
+                out[f"hr_z{zn}_sec"] = float(v)
+            except Exception:
+                pass
+            continue
+
+        # Power zone patterns:
+        # timeInPowerZone1, timeInPowerZone_1, powerZone1Seconds, etc.
+        m = re.match(r"(?i)^time(in)?powerzone[_]?(\d+)$", key) or re.match(
+            r"(?i)^powerzone[_]?(\d+)(seconds|sec)?$", key
+        )
+        if m:
+            zone_num = m.group(2) if len(m.groups()) >= 2 and m.group(2) else m.group(1)
+            try:
+                zn = int(zone_num)
+                out[f"pwr_z{zn}_sec"] = float(v)
+            except Exception:
+                pass
+            continue
+
+    # Normalize: ensure at least 1–5 HR zones exist as keys (even if None)
+    for i in range(1, 6):
+        out.setdefault(f"hr_z{i}_sec", None)
+
+    # Normalize: power zones commonly 1–7
+    for i in range(1, 8):
+        out.setdefault(f"pwr_z{i}_sec", None)
+
+    return out
+
+
+def fetch_activity_zones(activity_id: str) -> Dict[str, Any]:
+    """
+    Fetch activity details and return time-in-zone seconds (HR + Power) if available.
+    """
+    client = _get_garmin_client()
+
+    # 1) Try the most common method name
+    details: Dict[str, Any] = {}
+    if hasattr(client, "get_activity_details"):
+        details = client.get_activity_details(activity_id)
+    elif hasattr(client, "get_activity_detail"):
+        details = client.get_activity_detail(activity_id)
+    else:
+        # Last resort: try to fetch a generic "activity" payload if the lib supports it
+        if hasattr(client, "get_activity"):
+            details = client.get_activity(activity_id)
+        else:
+            raise RuntimeError("Garmin client has no activity-details method")
+
+    zones = _extract_time_in_zones(details)
+
+    return {
+        "activityId": str(activity_id),
+        "zones": zones,
+        # keep a tiny hint for debugging without dumping everything
+        "details_keys_sample": sorted(list(details.keys()))[:50],
+    }

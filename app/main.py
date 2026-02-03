@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
-from .garmin_client import fetch_activities, fetch_wellness, _get_garmin_client
+from .garmin_client import fetch_activities, fetch_activity_zones, fetch_wellness, _get_garmin_client
 
 app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
 
@@ -100,6 +100,16 @@ def get_activities(
     acts = fetch_activities(start, end)
     return ActivitiesResponse(activities=acts)
 
+@app.get("/activity_zones")
+def activity_zones(
+    activity_id: str = Query(..., alias="activityId"),
+    _auth: None = Depends(require_bearer_token),
+):
+    """
+    Returns HR + Power time-in-zone (seconds) for one activity.
+    Pass activityId from /activities results.
+    """
+    return fetch_activity_zones(activity_id)
 
 @app.get("/wellness", response_model=WellnessResponse)
 def get_wellness(
