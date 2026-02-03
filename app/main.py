@@ -326,3 +326,14 @@ def sleep_summary(
                 "error": str(e),
             },
         )
+
+from .garmin_client import fetch_sleep_range
+
+@app.get("/sleep_range")
+def get_sleep_range(
+    start: date = Query(...),
+    end: date = Query(...),
+    _auth: None = Depends(require_bearer_token),
+):
+    rows = fetch_sleep_range(start, end)
+    return {"days": rows, "count": len(rows), "start": start.isoformat(), "end": end.isoformat()}
