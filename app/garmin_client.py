@@ -432,9 +432,107 @@ def fetch_activity_zones(activity_id: str) -> Dict[str, Any]:
 
     zones = _extract_time_in_zones(details)
 
-    return {
-        "activityId": str(activity_id),
-        "zones": zones,
-        # keep a tiny hint for debugging without dumping everything
-        "details_keys_sample": sorted(list(details.keys()))[:50],
-    }
+def _extract_time_in_zones(details: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Best-effort extraction of time-in-zone seconds from Garmin activity details payload.
+    Handles both:
+      - flat keys like timeInHrZone1
+      - nested dict/list structures (common in Garmin payloads)
+
+    Output:
+      hr_z1_sec..hr_z5_sec
+      pwr_z1_sec..pwr_z7_sec
+    """
+    out: Dict[str, Optional[float]] = {}
+
+    def set_zone(prefix: str, zone: int, seconds: float):
+        key = f"{prefix}_z{zone}_sec"
+        if seconds is None:
+            return
+        # if it looks like milliseconds, convert to seconds
+        s = float(seconds)
+        if s > 100000:  # crude but safe for zone times
+            s = s / 1000.0
+        # sum if multiple segments exist
+        out[key] = (out.get(key) or 0.0) + s
+
+    def walk(node: Any, path: str = ""):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                key = str(k)
+                p = f"{path}.{key}" if path else key
+
+                # 1) Flat key patterns (top-level or nested)
+                if isinstance(v, (int, float)):
+                    m = re.match(r"(?i)^time(in)?hrzone[_]?(\d+)$", key) or re.match(
+                        r"(?i)^hrzone[_]?(\d+)(seconds|sec)?$", key
+                    )
+                    if m:
+                        zone_num = m.group(2) if len(m.groups()) >= 2 and m.group(2) else m.group(1)
+                        try:
+                            set_zone("hr", int(zone_num), float(v))
+                        except Exception:
+                            pass
+                        continue
+
+                    m = re.match(r"(?i)^time(in)?powerzone[_]?(\d+)$", key) or re.match(
+                        r"(?i)^powerzone[_]?(\d+)(seconds|sec)?$", key
+                    )
+                    if m:
+                        zone_num = m.group(2) if len(m.groups()) >= 2 and m.group(2) else m.group(1)
+                        try:
+                            set_zone("pwr", int(zone_num), float(v))
+                        except Exception:
+                            pass
+                        continue
+
+                # 2) Recurse
+                walk(v, p)
+
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                p = f"{path}[{i}]"
+                # Common “time in zones” list item shapes:
+                # { "zoneNumber": 1, "seconds": 1234 }
+                # { "zone": 1, "timeInSeconds": 1234 }
+                # { "start":..., "end":..., "zone": ... }
+                if isinstance(item, dict):
+                    # Try to infer HR vs Power from path
+                    path_l = path.lower()
+                    is_hr = any(s in path_l for s in ["hr", "heart", "heartrate"])
+                    is_pwr = any(s in path_l for s in ["power", "pwr", "watts"])
+
+                    zone = item.get("zoneNumber") or item.get("zone") or item.get("zoneIndex")
+                    secs = (
+                        item.get("seconds")
+                        or item.get("sec")
+                        or item.get("timeInSeconds")
+                        or item.get("durationInSeconds")
+                        or item.get("time")
+                        or item.get("duration")
+                    )
+
+                    if zone is not None and secs is not None:
+                        try:
+                            z = int(zone)
+                            if is_hr:
+                                set_zone("hr", z, float(secs))
+                            elif is_pwr:
+                                set_zone("pwr", z, float(secs))
+                            # If we can't infer, still recurse — sometimes nested deeper
+                        except Exception:
+                            pass
+
+                walk(item, p)
+
+        # primitives: ignore
+
+    walk(details or {})
+
+    # Normalize expected keys
+    for i in range(1, 6):
+        out.setdefault(f"hr_z{i}_sec", None)
+    for i in range(1, 8):
+        out.setdefault(f"pwr_z{i}_sec", None)
+
+    return out
