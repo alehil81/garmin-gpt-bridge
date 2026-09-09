@@ -1,11 +1,18 @@
 import os
 import base64
-from datetime import date
+import hashlib
+import json
+import math
+import time
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from threading import Lock
 from typing import List, Tuple
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException
-from garminconnect import Garmin
+from garminconnect import Garmin, GarminConnectTooManyRequestsError
 
 from .models import Activity, WellnessDay
 
@@ -17,7 +24,12 @@ OAUTH2_PATH = os.path.join(TOKENSTORE_DIR, "oauth2_token.json")
 
 _GARMIN_CLIENT: Garmin | None = None
 _GARMIN_CLIENT_LOCK = Lock()
+_TOKENSTORE_LOCK = Lock()
 _PASSWORD_LOGIN_ATTEMPTED = False
+_AUTH_FAILURE: dict = {}
+
+# This is a local quiet period, not a guarantee of Garmin's reset time.
+_RATE_LIMIT_QUIET_SECONDS = 30 * 60
 
 _OAUTH1_ENV_NAMES = ("OAUTH1_B64", "GARMIN_OAUTH1_B64", "GARTH_OAUTH1_B64")
 _OAUTH2_ENV_NAMES = ("OAUTH2_B64", "GARMIN_OAUTH2_B64", "GARTH_OAUTH2_B64")
@@ -39,25 +51,39 @@ def _write_tokens_from_env_to_disk() -> bool:
     b1 = _get_first_env(_OAUTH1_ENV_NAMES)
     b2 = _get_first_env(_OAUTH2_ENV_NAMES)
 
-    if not b1 or not b2:
+    if not b1 and not b2:
         return False
+    if not b1 or not b2:
+        raise HTTPException(500, "Both Garmin OAuth token variables are required.")
 
     os.makedirs(TOKENSTORE_DIR, exist_ok=True)
 
     try:
-        oauth1_bytes = base64.b64decode(b1)
-        oauth2_bytes = base64.b64decode(b2)
+        oauth1_bytes = base64.b64decode(b1, validate=True)
+        oauth2_bytes = base64.b64decode(b2, validate=True)
+        if not all(isinstance(json.loads(value), dict) for value in (oauth1_bytes, oauth2_bytes)):
+            raise ValueError("Token files must contain JSON objects")
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed base64 decode of Garmin OAuth tokens: {type(e).__name__}",
+            detail=f"Invalid Garmin OAuth token encoding or JSON: {type(e).__name__}",
         )
 
     try:
+        fingerprint = hashlib.sha256(oauth1_bytes + b"\0" + oauth2_bytes).hexdigest()
+        marker = Path(TOKENSTORE_DIR) / "env_tokens.sha256"
+        # Seed once per env-token pair. Keep refreshed tokens on subsequent attempts
+        # and on restarts where a persistent token directory is available.
+        if (marker.exists() and marker.read_text() == fingerprint
+                and os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)):
+            return True
         with open(OAUTH1_PATH, "wb") as f:
             f.write(oauth1_bytes)
         with open(OAUTH2_PATH, "wb") as f:
             f.write(oauth2_bytes)
+        os.chmod(OAUTH1_PATH, 0o600)
+        os.chmod(OAUTH2_PATH, 0o600)
+        marker.write_text(fingerprint)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -68,10 +94,110 @@ def _write_tokens_from_env_to_disk() -> bool:
     return True
 
 
-def _load_client_from_tokenstore() -> Garmin:
-    client = Garmin()
-    client.login(TOKENSTORE_DIR)
+def _save_tokens(client: Garmin) -> None:
+    with _TOKENSTORE_LOCK:
+        client.garth.dump(TOKENSTORE_DIR)
+        os.chmod(OAUTH1_PATH, 0o600)
+        os.chmod(OAUTH2_PATH, 0o600)
+
+
+def _new_client(**kwargs) -> Garmin:
+    client = Garmin(**kwargs)
+    # A response hook also saves tokens refreshed during later API requests.
+    def save_refreshed_tokens(response, *args, **kwargs):
+        if client.garth.oauth1_token and client.garth.oauth2_token:
+            _save_tokens(client)
+
+    client.garth.sess.hooks["response"].append(save_refreshed_tokens)
     return client
+
+
+def _load_client_from_tokenstore() -> Garmin:
+    client = _new_client()
+    client.login(TOKENSTORE_DIR)
+    _save_tokens(client)
+    return client
+
+
+def _failure_path() -> Path:
+    return Path(TOKENSTORE_DIR) / "auth_failure.json"
+
+
+def garmin_auth_status() -> dict:
+    """Read safe local diagnostics without contacting Garmin."""
+    failure = _AUTH_FAILURE
+    if not failure:
+        try:
+            failure = json.loads(_failure_path().read_text())
+        except (OSError, ValueError):
+            failure = {}
+    return {
+        "client_cached": _GARMIN_CLIENT is not None,
+        "last_failure_stage": failure.get("stage"),
+        "last_http_status": failure.get("http_status"),
+        "retry_after_seconds": max(0, math.ceil(failure.get("retry_at", 0) - time.time())),
+    }
+
+
+def _auth_error(error: Exception) -> HTTPException:
+    global _AUTH_FAILURE
+    status = None
+    stage = "session_initialization"
+    retry_after = 0
+    rate_limited = isinstance(error, GarminConnectTooManyRequestsError)
+    seen = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if response is not None:
+            status = response.status_code
+            path = urlsplit(response.url or "").path
+            if path == "/oauth-service/oauth/exchange/user/2.0":
+                stage = "oauth2_refresh"
+            elif path.startswith("/userprofile-service/"):
+                stage = "profile"
+            if status == 429:
+                rate_limited = True
+                value = response.headers.get("Retry-After", "")
+                try:
+                    retry_after = max(0, int(value))
+                except ValueError:
+                    try:
+                        retry_after = max(0, math.ceil(
+                            (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+                        ))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        # Garth wraps requests errors in .error rather than always using .__cause__.
+        pending.extend(e for e in (
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+            getattr(current, "error", None),
+        ) if isinstance(e, Exception))
+
+    delay = max(_RATE_LIMIT_QUIET_SECONDS, retry_after) if rate_limited else 60
+    _AUTH_FAILURE = {
+        "stage": stage,
+        "http_status": 429 if rate_limited else status,
+        "retry_at": time.time() + delay,
+    }
+    os.makedirs(TOKENSTORE_DIR, exist_ok=True)
+    _failure_path().write_text(json.dumps(_AUTH_FAILURE))
+    if rate_limited:
+        detail = (
+            f"Garmin returned HTTP 429 during {stage}. OAuth requests are paused for {delay} seconds. "
+            "This does not prove the tokens are invalid. Password login was not attempted."
+        )
+    else:
+        detail = (
+            f"Garmin OAuth session failed during {stage}: {type(error).__name__}. "
+            "Password login was not attempted."
+        )
+    return HTTPException(503 if rate_limited else 502, detail, headers={"Retry-After": str(delay)})
 
 
 def _login_client_with_credentials() -> Garmin:
@@ -90,11 +216,11 @@ def _login_client_with_credentials() -> Garmin:
     os.makedirs(TOKENSTORE_DIR, exist_ok=True)
     os.environ["GARTH_HOME"] = TOKENSTORE_DIR
 
-    client = Garmin(email=email, password=password)
+    client = _new_client(email=email, password=password)
     client.login()
 
     try:
-        client.garth.dump(TOKENSTORE_DIR)
+        _save_tokens(client)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -118,6 +244,14 @@ def _get_garmin_client() -> Garmin:
         if _GARMIN_CLIENT is not None:
             return _GARMIN_CLIENT
 
+        retry_after = garmin_auth_status()["retry_after_seconds"]
+        if retry_after:
+            raise HTTPException(
+                503,
+                f"Garmin authentication is paused. Retry after {retry_after} seconds; no Garmin request was sent.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
         have_env_tokens = _write_tokens_from_env_to_disk()
 
         have_disk_tokens = os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)
@@ -125,15 +259,11 @@ def _get_garmin_client() -> Garmin:
         if have_env_tokens or have_disk_tokens:
             try:
                 _GARMIN_CLIENT = _load_client_from_tokenstore()
+                _AUTH_FAILURE.clear()
+                _failure_path().unlink(missing_ok=True)
                 return _GARMIN_CLIENT
             except Exception as e:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Garmin OAuth token login failed: {type(e).__name__}. "
-                        "Refresh OAUTH1_B64/OAUTH2_B64 in Render; password login was not attempted."
-                    ),
-                )
+                raise _auth_error(e) from None
 
         if _PASSWORD_LOGIN_ATTEMPTED:
             raise HTTPException(

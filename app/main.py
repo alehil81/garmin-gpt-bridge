@@ -11,9 +11,9 @@ from fastapi.responses import JSONResponse
 
 from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
-from .garmin_client import fetch_activities, fetch_activity_zones, fetch_wellness, _get_garmin_client
+from .garmin_client import fetch_activities, fetch_activity_zones, fetch_wellness, _get_garmin_client, garmin_auth_status
 
-app = FastAPI(title="Garmin GPT Bridge", version="1.0.0")
+app = FastAPI(title="Garmin GPT Bridge", version="1.0.1")
 
 from fastapi import Header
 
@@ -47,7 +47,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "1.0.0"}
+    return {"version": app.version}
 
 
 @app.get("/")
@@ -165,6 +165,7 @@ def debug_env(_auth: None = Depends(require_bearer_token)):
         "oauth2_env_names_checked": oauth2_names,
         "has_garmin_email": bool(email),
         "has_garmin_password": bool(pwd),
+        "garmin_auth": garmin_auth_status(),
     }
 
 
