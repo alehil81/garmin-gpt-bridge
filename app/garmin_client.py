@@ -120,18 +120,20 @@ def _get_garmin_client() -> Garmin:
 
         have_env_tokens = _write_tokens_from_env_to_disk()
 
-        if have_env_tokens or (
-            os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)
-        ):
+        have_disk_tokens = os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)
+
+        if have_env_tokens or have_disk_tokens:
             try:
                 _GARMIN_CLIENT = _load_client_from_tokenstore()
                 return _GARMIN_CLIENT
             except Exception as e:
-                if _PASSWORD_LOGIN_ATTEMPTED:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"Garmin token login failed after credential fallback: {type(e).__name__}",
-                    )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Garmin OAuth token login failed: {type(e).__name__}. "
+                        "Refresh OAUTH1_B64/OAUTH2_B64 in Render; password login was not attempted."
+                    ),
+                )
 
         if _PASSWORD_LOGIN_ATTEMPTED:
             raise HTTPException(
