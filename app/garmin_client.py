@@ -1,32 +1,46 @@
 import os
 import base64
 from datetime import date
-from typing import List
+from threading import Lock
+from typing import List, Tuple
 
 from fastapi import HTTPException
 from garminconnect import Garmin
 
 from .models import Activity, WellnessDay
 
-# Tokenstore directory on Render (ephemeral but fine for runtime)
-TOKENSTORE_DIR = "/tmp/.garth"
+# Tokenstore directory on Render. Use a persistent disk path if one is mounted;
+# otherwise env-provided tokens repopulate this directory after each restart.
+TOKENSTORE_DIR = os.getenv("GARMIN_TOKENSTORE_DIR", "/tmp/.garth")
 OAUTH1_PATH = os.path.join(TOKENSTORE_DIR, "oauth1_token.json")
 OAUTH2_PATH = os.path.join(TOKENSTORE_DIR, "oauth2_token.json")
 
+_GARMIN_CLIENT: Garmin | None = None
+_GARMIN_CLIENT_LOCK = Lock()
+_PASSWORD_LOGIN_ATTEMPTED = False
 
-def _write_tokens_from_env_to_disk() -> None:
+_OAUTH1_ENV_NAMES = ("OAUTH1_B64", "GARMIN_OAUTH1_B64", "GARTH_OAUTH1_B64")
+_OAUTH2_ENV_NAMES = ("OAUTH2_B64", "GARMIN_OAUTH2_B64", "GARTH_OAUTH2_B64")
+
+
+def _get_first_env(names: Tuple[str, ...]) -> str | None:
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _write_tokens_from_env_to_disk() -> bool:
     """
-    Decode GARTH_OAUTH1_B64 and GARTH_OAUTH2_B64 env vars and write them
-    into TOKENSTORE_DIR as oauth1_token.json / oauth2_token.json.
+    Decode OAuth token env vars and write them into TOKENSTORE_DIR.
+    Returns True when both token files were restored.
     """
-    b1 = os.getenv("GARTH_OAUTH1_B64")
-    b2 = os.getenv("GARTH_OAUTH2_B64")
+    b1 = _get_first_env(_OAUTH1_ENV_NAMES)
+    b2 = _get_first_env(_OAUTH2_ENV_NAMES)
 
     if not b1 or not b2:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing GARTH_OAUTH1_B64 or GARTH_OAUTH2_B64 env vars",
-        )
+        return False
 
     os.makedirs(TOKENSTORE_DIR, exist_ok=True)
 
@@ -36,7 +50,7 @@ def _write_tokens_from_env_to_disk() -> None:
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed base64 decode of GARTH tokens: {type(e).__name__}",
+            detail=f"Failed base64 decode of Garmin OAuth tokens: {type(e).__name__}",
         )
 
     try:
@@ -50,24 +64,96 @@ def _write_tokens_from_env_to_disk() -> None:
             detail=f"Failed writing token files: {type(e).__name__}",
         )
 
+    os.environ["GARTH_HOME"] = TOKENSTORE_DIR
+    return True
+
+
+def _load_client_from_tokenstore() -> Garmin:
+    client = Garmin()
+    client.login(TOKENSTORE_DIR)
+    return client
+
+
+def _login_client_with_credentials() -> Garmin:
+    email = (os.getenv("GARMIN_EMAIL") or "").strip()
+    password = (os.getenv("GARMIN_PASSWORD") or "").strip()
+
+    if not email or not password:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Missing valid OAuth tokens and missing GARMIN_EMAIL/GARMIN_PASSWORD. "
+                "Set OAUTH1_B64 and OAUTH2_B64 in Render to avoid password login."
+            ),
+        )
+
+    os.makedirs(TOKENSTORE_DIR, exist_ok=True)
+    os.environ["GARTH_HOME"] = TOKENSTORE_DIR
+
+    client = Garmin(email=email, password=password)
+    client.login()
+
+    try:
+        client.garth.dump(TOKENSTORE_DIR)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Garmin login succeeded but token persistence failed: {type(e).__name__}",
+        )
+
+    return client
+
 
 def _get_garmin_client() -> Garmin:
     """
-    Create a Garmin client and authenticate using tokenstore directory.
-    This avoids email/password login (and avoids repeated MFA prompts).
+    Return a cached authenticated Garmin client.
+    Restore OAuth tokens first; only fall back to credentials once per process.
     """
-    _write_tokens_from_env_to_disk()
+    global _GARMIN_CLIENT, _PASSWORD_LOGIN_ATTEMPTED
 
-    try:
-        client = Garmin()  # no username/password
-        # IMPORTANT: tokenstore must be a DIRECTORY containing oauth1/2 json files
-        client.login(TOKENSTORE_DIR)
-        return client
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Garmin token login failed: {type(e).__name__}",
-        )
+    if _GARMIN_CLIENT is not None:
+        return _GARMIN_CLIENT
+
+    with _GARMIN_CLIENT_LOCK:
+        if _GARMIN_CLIENT is not None:
+            return _GARMIN_CLIENT
+
+        have_env_tokens = _write_tokens_from_env_to_disk()
+
+        if have_env_tokens or (
+            os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)
+        ):
+            try:
+                _GARMIN_CLIENT = _load_client_from_tokenstore()
+                return _GARMIN_CLIENT
+            except Exception as e:
+                if _PASSWORD_LOGIN_ATTEMPTED:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Garmin token login failed after credential fallback: {type(e).__name__}",
+                    )
+
+        if _PASSWORD_LOGIN_ATTEMPTED:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Garmin credential login was already attempted for this process. "
+                    "Add fresh OAUTH1_B64/OAUTH2_B64 tokens in Render before retrying."
+                ),
+            )
+
+        _PASSWORD_LOGIN_ATTEMPTED = True
+
+        try:
+            _GARMIN_CLIENT = _login_client_with_credentials()
+            return _GARMIN_CLIENT
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Garmin password login failed: {type(e).__name__}",
+            )
 
 
 def _activity_in_range(ts: str, start: date, end: date) -> bool:
@@ -431,6 +517,14 @@ def fetch_activity_zones(activity_id: str) -> Dict[str, Any]:
             raise RuntimeError("Garmin client has no activity-details method")
 
     zones = _extract_time_in_zones(details)
+    return {
+        "activityId": activity_id,
+        "zones": zones,
+        "has_hr_zones": any(v is not None for k, v in zones.items() if k.startswith("hr_")),
+        "has_power_zones": any(
+            v is not None for k, v in zones.items() if k.startswith("pwr_")
+        ),
+    }
 
 def _extract_time_in_zones(details: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """

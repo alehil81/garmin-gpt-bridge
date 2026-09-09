@@ -147,8 +147,10 @@ def debug_env(_auth: None = Depends(require_bearer_token)):
         return (os.getenv(name) or "").strip()
 
     api = _val("API_KEY")
-    g1 = _val("GARMIN_OAUTH1_B64")
-    g2 = _val("GARMIN_OAUTH2_B64")
+    oauth1_names = ("OAUTH1_B64", "GARMIN_OAUTH1_B64", "GARTH_OAUTH1_B64")
+    oauth2_names = ("OAUTH2_B64", "GARMIN_OAUTH2_B64", "GARTH_OAUTH2_B64")
+    g1 = next((_val(name) for name in oauth1_names if _val(name)), "")
+    g2 = next((_val(name) for name in oauth2_names if _val(name)), "")
     email = _val("GARMIN_EMAIL")
     pwd = _val("GARMIN_PASSWORD")
 
@@ -159,6 +161,8 @@ def debug_env(_auth: None = Depends(require_bearer_token)):
         "has_oauth2_b64": bool(g2),
         "len_oauth1_b64": len(g1),
         "len_oauth2_b64": len(g2),
+        "oauth1_env_names_checked": oauth1_names,
+        "oauth2_env_names_checked": oauth2_names,
         "has_garmin_email": bool(email),
         "has_garmin_password": bool(pwd),
     }

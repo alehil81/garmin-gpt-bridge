@@ -8,3 +8,11 @@ services:
     envVars:
       - key: API_KEY
         sync: false
+      - key: GARMIN_EMAIL
+        sync: false
+      - key: GARMIN_PASSWORD
+        sync: false
+      - key: OAUTH1_B64
+        sync: false
+      - key: OAUTH2_B64
+        sync: false
