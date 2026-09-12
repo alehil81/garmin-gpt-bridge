@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch, Mock
 
@@ -12,6 +13,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from garminconnect import GarminConnectTooManyRequestsError
 from garth.exc import GarthHTTPError
+from garth.auth_tokens import OAuth2Token
 
 from app import garmin_client as gc
 from app.main import app
@@ -119,6 +121,93 @@ class AuthTests(unittest.TestCase):
         gc._write_tokens_from_env_to_disk()
         self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text())["access_token"], "refreshed-after-startup")
 
+    def expired_client(self):
+        gc._write_tokens_from_env_to_disk()
+        client = gc._new_client()
+        client.garth.load(gc.TOKENSTORE_DIR)
+        client.garth.oauth2_token.expires_at = int(time.time()) - 60
+        return client
+
+    def test_cached_client_refresh_failure_obeys_cooldown(self):
+        client = self.expired_client()
+        gc._GARMIN_CLIENT = client
+        with patch("garth.sso.exchange", side_effect=self.rate_error()) as exchange, \
+                patch.object(gc, "_login_client_with_credentials") as password:
+            for _ in range(3):
+                with self.assertRaises(HTTPException) as caught:
+                    gc._get_garmin_client()
+                self.assertEqual(caught.exception.status_code, 503)
+            exchange.assert_called_once()
+            password.assert_not_called()
+
+    def test_refresh_within_api_calls_obeys_cooldown(self):
+        client = self.expired_client()
+        with patch("garth.sso.exchange", side_effect=self.rate_error()) as exchange:
+            for _ in range(3):
+                with self.assertRaises(HTTPException):
+                    client.garth.connectapi("/userprofile-service/socialProfile")
+            exchange.assert_called_once()
+
+    def test_refresh_saves_tokens_before_any_following_api_request(self):
+        client = self.expired_client()
+        refreshed = OAuth2Token(**{**self.oauth2, "access_token": "renewed"})
+        with patch("garth.sso.exchange", return_value=refreshed) as exchange:
+            client.garth.refresh_oauth2()
+            exchange.assert_called_once()
+        self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text())["access_token"], "renewed")
+        # Simulate restart while the same local files still exist.
+        gc._write_tokens_from_env_to_disk()
+        restored = gc._new_client()
+        restored.garth.load(gc.TOKENSTORE_DIR)
+        self.assertEqual(restored.garth.oauth2_token.access_token, "renewed")
+
+    def test_concurrent_expiry_uses_one_refresh(self):
+        client = self.expired_client()
+        refreshed = OAuth2Token(**{**self.oauth2, "access_token": "renewed"})
+        with patch("garth.sso.exchange", return_value=refreshed) as exchange:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(lambda _: client.garth.refresh_oauth2(), range(8)))
+            exchange.assert_called_once()
+
+    def test_valid_cached_token_needs_no_refresh(self):
+        client = self.expired_client()
+        client.garth.oauth2_token.expires_at = int(time.time()) + 3600
+        gc._GARMIN_CLIENT = client
+        with patch("garth.sso.exchange") as exchange:
+            self.assertIs(gc._get_garmin_client(), client)
+            exchange.assert_not_called()
+
+    def test_http_adapter_does_not_retry_after_restoring_tokens(self):
+        client = self.expired_client()
+        self.assertEqual(client.garth.sess.get_adapter("https://").max_retries.total, 0)
+
+    def test_interrupted_write_keeps_the_previous_token(self):
+        gc._write_tokens_from_env_to_disk()
+        previous = Path(gc.OAUTH2_PATH).read_bytes()
+        with patch.object(gc.os, "replace", side_effect=OSError("simulated interruption")):
+            with self.assertRaises(OSError):
+                gc._atomic_write(Path(gc.OAUTH2_PATH), b"replacement")
+        self.assertEqual(Path(gc.OAUTH2_PATH).read_bytes(), previous)
+        self.assertFalse(list(self.directory.glob(".oauth2_token.json.*")))
+        self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
+
+    def test_wrapped_guard_preserves_original_failure_and_cooldown(self):
+        with patch.object(gc.time, "time", return_value=1000):
+            original = gc._auth_error(self.rate_error())
+        wrapped = RuntimeError("library wrapper")
+        wrapped.__context__ = original
+        with patch.object(gc.time, "time", return_value=1100):
+            self.assertIs(gc._auth_error(wrapped), original)
+            self.assertEqual(gc.garmin_auth_status()["retry_after_seconds"], 1700)
+        self.assertEqual(gc.garmin_auth_status()["last_failure_stage"], "oauth2_refresh")
+
+    def test_safe_diagnostics_expose_expiry_but_not_credentials(self):
+        gc._write_tokens_from_env_to_disk()
+        status = gc.garmin_auth_status()
+        self.assertEqual(status["access_token_expires_at"], self.oauth2["expires_at"])
+        self.assertFalse(status["access_token_expired"])
+        self.assertNotIn("test-refresh", json.dumps(status))
+
     def test_invalid_or_partial_env_does_not_use_password(self):
         for value in ("", "not-base64", self.encode(["wrong shape"])):
             os.environ["OAUTH2_B64"] = value
@@ -134,7 +223,7 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["garmin_auth"]["retry_after_seconds"], 0)
         self.assertNotIn("test-access", result.text)
-        self.assertEqual(client.get("/version").json(), {"version": "1.0.1"})
+        self.assertEqual(client.get("/version").json(), {"version": "1.0.2"})
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import math
+import tempfile
 import time
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 from garminconnect import Garmin, GarminConnectTooManyRequestsError
+from garth.auth_tokens import OAuth2Token
 
 from .models import Activity, WellnessDay
 
@@ -24,6 +26,7 @@ OAUTH2_PATH = os.path.join(TOKENSTORE_DIR, "oauth2_token.json")
 
 _GARMIN_CLIENT: Garmin | None = None
 _GARMIN_CLIENT_LOCK = Lock()
+_OAUTH_REFRESH_LOCK = Lock()
 _TOKENSTORE_LOCK = Lock()
 _PASSWORD_LOGIN_ATTEMPTED = False
 _AUTH_FAILURE: dict = {}
@@ -41,6 +44,20 @@ def _get_first_env(names: Tuple[str, ...]) -> str | None:
         if value:
             return value
     return None
+
+
+def _atomic_write(path: Path, payload: str | bytes) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload.encode() if isinstance(payload, str) else payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _write_tokens_from_env_to_disk() -> bool:
@@ -77,13 +94,9 @@ def _write_tokens_from_env_to_disk() -> bool:
         if (marker.exists() and marker.read_text() == fingerprint
                 and os.path.exists(OAUTH1_PATH) and os.path.exists(OAUTH2_PATH)):
             return True
-        with open(OAUTH1_PATH, "wb") as f:
-            f.write(oauth1_bytes)
-        with open(OAUTH2_PATH, "wb") as f:
-            f.write(oauth2_bytes)
-        os.chmod(OAUTH1_PATH, 0o600)
-        os.chmod(OAUTH2_PATH, 0o600)
-        marker.write_text(fingerprint)
+        _atomic_write(Path(OAUTH1_PATH), oauth1_bytes)
+        _atomic_write(Path(OAUTH2_PATH), oauth2_bytes)
+        _atomic_write(marker, fingerprint)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -96,13 +109,33 @@ def _write_tokens_from_env_to_disk() -> bool:
 
 def _save_tokens(client: Garmin) -> None:
     with _TOKENSTORE_LOCK:
-        client.garth.dump(TOKENSTORE_DIR)
-        os.chmod(OAUTH1_PATH, 0o600)
-        os.chmod(OAUTH2_PATH, 0o600)
+        oauth1, oauth2 = json.loads(base64.b64decode(client.garth.dumps()))
+        _atomic_write(Path(OAUTH1_PATH), json.dumps(oauth1))
+        _atomic_write(Path(OAUTH2_PATH), json.dumps(oauth2))
 
 
 def _new_client(**kwargs) -> Garmin:
     client = Garmin(**kwargs)
+    # Let the bridge enforce Retry-After; do not hide retries inside HTTP adapters.
+    client.garth.configure(retries=0)
+    original_refresh = client.garth.refresh_oauth2
+
+    def refresh_oauth2():
+        # Garth can refresh inside any API call, including after client caching.
+        with _OAUTH_REFRESH_LOCK:
+            _raise_if_auth_paused()
+            token = client.garth.oauth2_token
+            if isinstance(token, OAuth2Token) and not token.expired:
+                return
+            try:
+                original_refresh()
+            except Exception as error:
+                raise _auth_error(error) from None
+            _save_tokens(client)
+            _AUTH_FAILURE.clear()
+            _failure_path().unlink(missing_ok=True)
+
+    client.garth.refresh_oauth2 = refresh_oauth2
     # A response hook also saves tokens refreshed during later API requests.
     def save_refreshed_tokens(response, *args, **kwargs):
         if client.garth.oauth1_token and client.garth.oauth2_token:
@@ -131,16 +164,40 @@ def garmin_auth_status() -> dict:
             failure = json.loads(_failure_path().read_text())
         except (OSError, ValueError):
             failure = {}
+    expires_at = None
+    try:
+        token = json.loads(Path(OAUTH2_PATH).read_text())
+        expiry = token.get("expires_at")
+        if isinstance(expiry, (int, float)) and not isinstance(expiry, bool) and math.isfinite(expiry):
+            expires_at = expiry
+    except (OSError, ValueError, AttributeError):
+        pass
     return {
         "client_cached": _GARMIN_CLIENT is not None,
         "last_failure_stage": failure.get("stage"),
         "last_http_status": failure.get("http_status"),
         "retry_after_seconds": max(0, math.ceil(failure.get("retry_at", 0) - time.time())),
+        "access_token_expires_at": expires_at,
+        "access_token_expired": expires_at < time.time() if expires_at is not None else None,
     }
+
+
+def _raise_if_auth_paused() -> None:
+    retry_after = garmin_auth_status()["retry_after_seconds"]
+    if retry_after:
+        raise HTTPException(
+            503,
+            f"Garmin authentication is paused. Retry after {retry_after} seconds; no Garmin request was sent.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _auth_error(error: Exception) -> HTTPException:
     global _AUTH_FAILURE
+    # The client library can wrap our own guard in a Garmin exception.
+    # Preserve that response, including its original cooldown, without nesting it.
+    if isinstance(error, HTTPException):
+        return error
     status = None
     stage = "session_initialization"
     retry_after = 0
@@ -152,6 +209,8 @@ def _auth_error(error: Exception) -> HTTPException:
         if id(current) in seen:
             continue
         seen.add(id(current))
+        if isinstance(current, HTTPException):
+            return current
         response = getattr(current, "response", None)
         if response is not None:
             status = response.status_code
@@ -186,7 +245,7 @@ def _auth_error(error: Exception) -> HTTPException:
         "retry_at": time.time() + delay,
     }
     os.makedirs(TOKENSTORE_DIR, exist_ok=True)
-    _failure_path().write_text(json.dumps(_AUTH_FAILURE))
+    _atomic_write(_failure_path(), json.dumps(_AUTH_FAILURE))
     if rate_limited:
         detail = (
             f"Garmin returned HTTP 429 during {stage}. OAuth requests are paused for {delay} seconds. "
@@ -237,20 +296,13 @@ def _get_garmin_client() -> Garmin:
     """
     global _GARMIN_CLIENT, _PASSWORD_LOGIN_ATTEMPTED
 
-    if _GARMIN_CLIENT is not None:
-        return _GARMIN_CLIENT
-
     with _GARMIN_CLIENT_LOCK:
+        _raise_if_auth_paused()
         if _GARMIN_CLIENT is not None:
+            token = _GARMIN_CLIENT.garth.oauth2_token
+            if not isinstance(token, OAuth2Token) or token.expired:
+                _GARMIN_CLIENT.garth.refresh_oauth2()
             return _GARMIN_CLIENT
-
-        retry_after = garmin_auth_status()["retry_after_seconds"]
-        if retry_after:
-            raise HTTPException(
-                503,
-                f"Garmin authentication is paused. Retry after {retry_after} seconds; no Garmin request was sent.",
-                headers={"Retry-After": str(retry_after)},
-            )
 
         have_env_tokens = _write_tokens_from_env_to_disk()
 

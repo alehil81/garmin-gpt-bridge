@@ -13,7 +13,7 @@ from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_activity_zones, fetch_wellness, _get_garmin_client, garmin_auth_status
 
-app = FastAPI(title="Garmin GPT Bridge", version="1.0.1")
+app = FastAPI(title="Garmin GPT Bridge", version="1.0.2")
 
 from fastapi import Header
 
