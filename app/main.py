@@ -13,7 +13,7 @@ from .auth import require_bearer_token
 from .models import ActivitiesResponse, WellnessResponse, DailySummaryResponse
 from .garmin_client import fetch_activities, fetch_activity_zones, fetch_wellness, _get_garmin_client, garmin_auth_status
 
-app = FastAPI(title="Garmin GPT Bridge", version="1.0.2")
+app = FastAPI(title="Garmin GPT Bridge", version="1.1.0")
 
 from fastapi import Header
 
@@ -202,6 +202,8 @@ def debug_sleep(
         body = client.get_stats_and_body(day.isoformat())
         try:
             readiness = client.get_training_readiness(day.isoformat())
+        except HTTPException:
+            raise
         except Exception as e:
             readiness = None
             readiness_error = f"{type(e).__name__}: {e}"
@@ -220,6 +222,8 @@ def debug_sleep(
                 "training_readiness_error": readiness_error,
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -258,6 +262,8 @@ def sleep_summary(
         try:
             readiness = client.get_training_readiness(day.isoformat())
             readiness_error = None
+        except HTTPException:
+            raise
         except Exception as e:
             readiness = None
             readiness_error = f"{type(e).__name__}: {e}"
@@ -332,6 +338,8 @@ def sleep_summary(
             "training_readiness_error": readiness_error,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=502,

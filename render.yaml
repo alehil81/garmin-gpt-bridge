@@ -8,11 +8,9 @@ services:
     envVars:
       - key: API_KEY
         sync: false
-      - key: GARMIN_EMAIL
+      - key: GARMIN_TOKEN_DATABASE_URL
         sync: false
-      - key: GARMIN_PASSWORD
+      - key: GARMIN_TOKEN_ENCRYPTION_KEY
         sync: false
-      - key: OAUTH1_B64
-        sync: false
-      - key: OAUTH2_B64
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.14.3

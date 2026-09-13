@@ -1,229 +1,297 @@
 import base64
+import copy
 import json
 import os
-import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from unittest.mock import patch, Mock
+from contextlib import contextmanager
+from threading import RLock
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from garminconnect import GarminConnectTooManyRequestsError
-from garth.exc import GarthHTTPError
-from garth.auth_tokens import OAuth2Token
 
-from app import garmin_client as gc
+from app import garmin_session as auth
+from app import garmin_client as data
 from app.main import app
+from app.token_store import TokenStore, TokenStoreError
+
+
+def tokens(expiry=None, marker="initial"):
+    def part(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+    jwt = ".".join((part({"alg": "RS256"}), part({
+        "exp": expiry if expiry is not None else time.time() + 86400,
+        "client_id": "test-client", "jti": marker,
+    }), "test-signature"))
+    return {"di_token": jwt, "di_refresh_token": "refresh-" + marker, "di_client_id": "test-client"}
+
+
+def response(status=200, retry_after="", renewed=None):
+    result = requests.Response()
+    result.status_code = status
+    result.url = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
+    result.headers["Retry-After"] = retry_after
+    renewed = renewed or tokens(marker="renewed")
+    result._content = json.dumps({"access_token": renewed["di_token"],
+                                 "refresh_token": renewed["di_refresh_token"]}).encode()
+    return result
+
+
+class MemoryStore:
+    def __init__(self, initial):
+        self.record = {"schema": 1, "tokens": initial, "failure": {}}
+        self.lock = RLock()
+        self.fail_commit = False
+
+    def read(self):
+        return copy.deepcopy(self.record)
+
+    @contextmanager
+    def locked(self):
+        with self.lock:
+            working = self.read()
+            yield working
+            if self.fail_commit:
+                self.fail_commit = False
+                raise TokenStoreError("Simulated failed commit")
+            self.record = copy.deepcopy(working)
 
 
 class AuthTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.directory = Path(self.temp.name)
-        self.oauth1 = {
-            "oauth_token": "test-oauth1", "oauth_token_secret": "test-secret",
-            "domain": "garmin.com",
-        }
-        self.oauth2 = {
-            "scope": "test", "jti": "test", "token_type": "Bearer",
-            "access_token": "test-access", "refresh_token": "test-refresh",
-            "expires_in": 3600, "expires_at": int(time.time()) + 3600,
-            "refresh_token_expires_in": 86400,
-            "refresh_token_expires_at": int(time.time()) + 86400,
-        }
-        env = {
-            "API_KEY": "test-key",
-            "OAUTH1_B64": self.encode(self.oauth1),
-            "OAUTH2_B64": self.encode(self.oauth2),
-        }
+        self.now = time.time()
+        self.store = MemoryStore(tokens(self.now - 1))
+        self.manager = auth.SessionManager(self.store)
+        self.manager._new_client()
         patches = [
-            patch.dict(os.environ, env, clear=True),
-            patch.object(gc, "TOKENSTORE_DIR", str(self.directory)),
-            patch.object(gc, "OAUTH1_PATH", str(self.directory / "oauth1_token.json")),
-            patch.object(gc, "OAUTH2_PATH", str(self.directory / "oauth2_token.json")),
-            patch.object(gc, "_GARMIN_CLIENT", None),
-            patch.object(gc, "_AUTH_FAILURE", {}),
-            patch.object(gc, "_PASSWORD_LOGIN_ATTEMPTED", False),
+            patch.dict(os.environ, {"API_KEY": "test-key"}, clear=True),
+            patch.object(auth, "_MANAGER", self.manager),
             patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected network request")),
+            patch("garminconnect.Garmin.login", side_effect=AssertionError("Password login forbidden")),
+            patch("garminconnect.client.Client.login", side_effect=AssertionError("Password login forbidden")),
         ]
         for item in patches:
             item.start()
             self.addCleanup(item.stop)
 
-    @staticmethod
-    def encode(value):
-        return base64.b64encode(json.dumps(value).encode()).decode()
+    def test_expired_token_renews_once_and_is_saved(self):
+        renewed = tokens(marker="new")
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(renewed=renewed)) as post:
+            self.manager.ensure_session()
+            self.manager.ensure_session()
+        post.assert_called_once()
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(self.store.record["tokens"], renewed)
+        self.assertEqual(self.store.record["failure"], {})
 
-    @staticmethod
-    def rate_error(retry_after=""):
-        response = requests.Response()
-        response.status_code = 429
-        response.url = "https://connectapi.garmin.com/oauth-service/oauth/exchange/user/2.0?secret=never-log"
-        response.headers["Retry-After"] = retry_after
-        inner = requests.HTTPError("sensitive upstream message", response=response)
-        error = GarminConnectTooManyRequestsError("rate limit")
-        error.__cause__ = GarthHTTPError("request failed", inner)
-        return error
+    def test_valid_token_does_not_renew(self):
+        self.store.record["tokens"] = tokens()
+        with patch.object(self.manager._client.client.cs, "post") as post:
+            self.manager.ensure_session()
+        post.assert_not_called()
 
-    def test_repeated_calls_and_restart_do_not_retry_during_cooldown(self):
-        with patch.object(gc, "_load_client_from_tokenstore", side_effect=self.rate_error()) as load, \
-                patch.object(gc, "_login_client_with_credentials") as password:
-            for attempt in range(3):
-                if attempt == 2:
-                    gc._AUTH_FAILURE = {}  # Simulate a process restart with the same disk.
-                with self.assertRaises(HTTPException) as caught:
-                    gc._get_garmin_client()
-                self.assertEqual(caught.exception.status_code, 503)
-                self.assertGreater(int(caught.exception.headers["Retry-After"]), 0)
-            load.assert_called_once()
-            password.assert_not_called()
-        status = gc.garmin_auth_status()
-        self.assertEqual(status["last_failure_stage"], "oauth2_refresh")
-        self.assertEqual(status["last_http_status"], 429)
-        self.assertNotIn("never-log", gc._failure_path().read_text())
-        self.assertNotIn("sensitive", gc._failure_path().read_text())
+    def test_new_process_restores_renewed_token_without_environment_seeds(self):
+        with patch.object(self.manager._client.client.cs, "post", return_value=response()):
+            self.manager.ensure_session()
+        restarted = auth.SessionManager(self.store)
+        restarted.ensure_session()
+        self.assertEqual(json.loads(restarted._client.client.dumps()), self.store.record["tokens"])
 
-    def test_retry_after_and_successful_recovery(self):
-        with patch.object(gc.time, "time", return_value=1000):
-            error = gc._auth_error(self.rate_error("7200"))
-            self.assertEqual(error.headers["Retry-After"], "7200")
-        client = Mock()
-        with patch.object(gc.time, "time", return_value=8201), \
-                patch.object(gc, "_load_client_from_tokenstore", return_value=client) as load:
-            self.assertIs(gc._get_garmin_client(), client)
-            self.assertIs(gc._get_garmin_client(), client)
-            load.assert_called_once()
-        self.assertFalse(gc._failure_path().exists())
-        self.assertEqual(gc._AUTH_FAILURE, {})
-
-    def test_env_restore_preserves_refreshed_disk_tokens(self):
-        gc._write_tokens_from_env_to_disk()
-        new_token = {**self.oauth2, "access_token": "refreshed"}
-        Path(gc.OAUTH2_PATH).write_text(json.dumps(new_token))
-        gc._write_tokens_from_env_to_disk()
-        self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text()), new_token)
-        os.environ["OAUTH2_B64"] = self.encode({**self.oauth2, "access_token": "new-env"})
-        gc._write_tokens_from_env_to_disk()
-        self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text())["access_token"], "new-env")
-        self.assertEqual(Path(gc.OAUTH2_PATH).stat().st_mode & 0o777, 0o600)
-
-    def test_actual_garth_refresh_is_saved_by_response_hook(self):
-        gc._write_tokens_from_env_to_disk()
-        client = gc._new_client()
-        client.garth.load(gc.TOKENSTORE_DIR)
-        client.garth.oauth2_token.access_token = "refreshed-after-startup"
-        for hook in client.garth.sess.hooks["response"]:
-            hook(requests.Response())
-        gc._write_tokens_from_env_to_disk()
-        self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text())["access_token"], "refreshed-after-startup")
-
-    def expired_client(self):
-        gc._write_tokens_from_env_to_disk()
-        client = gc._new_client()
-        client.garth.load(gc.TOKENSTORE_DIR)
-        client.garth.oauth2_token.expires_at = int(time.time()) - 60
-        return client
-
-    def test_cached_client_refresh_failure_obeys_cooldown(self):
-        client = self.expired_client()
-        gc._GARMIN_CLIENT = client
-        with patch("garth.sso.exchange", side_effect=self.rate_error()) as exchange, \
-                patch.object(gc, "_login_client_with_credentials") as password:
-            for _ in range(3):
-                with self.assertRaises(HTTPException) as caught:
-                    gc._get_garmin_client()
-                self.assertEqual(caught.exception.status_code, 503)
-            exchange.assert_called_once()
-            password.assert_not_called()
-
-    def test_refresh_within_api_calls_obeys_cooldown(self):
-        client = self.expired_client()
-        with patch("garth.sso.exchange", side_effect=self.rate_error()) as exchange:
-            for _ in range(3):
-                with self.assertRaises(HTTPException):
-                    client.garth.connectapi("/userprofile-service/socialProfile")
-            exchange.assert_called_once()
-
-    def test_refresh_saves_tokens_before_any_following_api_request(self):
-        client = self.expired_client()
-        refreshed = OAuth2Token(**{**self.oauth2, "access_token": "renewed"})
-        with patch("garth.sso.exchange", return_value=refreshed) as exchange:
-            client.garth.refresh_oauth2()
-            exchange.assert_called_once()
-        self.assertEqual(json.loads(Path(gc.OAUTH2_PATH).read_text())["access_token"], "renewed")
-        # Simulate restart while the same local files still exist.
-        gc._write_tokens_from_env_to_disk()
-        restored = gc._new_client()
-        restored.garth.load(gc.TOKENSTORE_DIR)
-        self.assertEqual(restored.garth.oauth2_token.access_token, "renewed")
-
-    def test_concurrent_expiry_uses_one_refresh(self):
-        client = self.expired_client()
-        refreshed = OAuth2Token(**{**self.oauth2, "access_token": "renewed"})
-        with patch("garth.sso.exchange", return_value=refreshed) as exchange:
+    def test_two_instances_and_threads_share_one_renewal(self):
+        other = auth.SessionManager(self.store)
+        with patch("requests.sessions.Session.post", return_value=response()) as post:
+            managers = [self.manager, other] * 4
             with ThreadPoolExecutor(max_workers=4) as pool:
-                list(pool.map(lambda _: client.garth.refresh_oauth2(), range(8)))
-            exchange.assert_called_once()
+                list(pool.map(lambda item: item.ensure_session(), managers))
+        post.assert_called_once()
 
-    def test_valid_cached_token_needs_no_refresh(self):
-        client = self.expired_client()
-        client.garth.oauth2_token.expires_at = int(time.time()) + 3600
-        gc._GARMIN_CLIENT = client
-        with patch("garth.sso.exchange") as exchange:
-            self.assertIs(gc._get_garmin_client(), client)
-            exchange.assert_not_called()
+    def test_429_cooldown_survives_new_process(self):
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(429)) as post:
+            for _ in range(3):
+                with self.assertRaises(HTTPException) as caught:
+                    self.manager.ensure_session()
+                self.assertEqual(caught.exception.status_code, 503)
+        post.assert_called_once()
+        restarted = auth.SessionManager(self.store)
+        with self.assertRaises(HTTPException):
+            restarted.ensure_session()
+        self.assertEqual(restarted.status()["last_http_status"], 429)
+        self.assertGreater(restarted.status()["retry_after_seconds"], 0)
 
-    def test_http_adapter_does_not_retry_after_restoring_tokens(self):
-        client = self.expired_client()
-        self.assertEqual(client.garth.sess.get_adapter("https://").max_retries.total, 0)
+    def test_retry_after_is_honored_and_recovery_clears_failure(self):
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(429, "7200")):
+            with self.assertRaises(HTTPException):
+                self.manager.ensure_session()
+        self.assertGreaterEqual(self.manager.status()["retry_after_seconds"], 7199)
+        renewed = tokens(self.now + 20000, "later")
+        with patch.object(auth.time, "time", return_value=self.now + 7201), \
+                patch.object(self.manager._client.client.cs, "post", return_value=response(renewed=renewed)):
+            self.manager.ensure_session()
+        self.assertEqual(self.store.record["failure"], {})
 
-    def test_interrupted_write_keeps_the_previous_token(self):
-        gc._write_tokens_from_env_to_disk()
-        previous = Path(gc.OAUTH2_PATH).read_bytes()
-        with patch.object(gc.os, "replace", side_effect=OSError("simulated interruption")):
-            with self.assertRaises(OSError):
-                gc._atomic_write(Path(gc.OAUTH2_PATH), b"replacement")
-        self.assertEqual(Path(gc.OAUTH2_PATH).read_bytes(), previous)
-        self.assertFalse(list(self.directory.glob(".oauth2_token.json.*")))
-        self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
-
-    def test_wrapped_guard_preserves_original_failure_and_cooldown(self):
-        with patch.object(gc.time, "time", return_value=1000):
-            original = gc._auth_error(self.rate_error())
-        wrapped = RuntimeError("library wrapper")
-        wrapped.__context__ = original
-        with patch.object(gc.time, "time", return_value=1100):
-            self.assertIs(gc._auth_error(wrapped), original)
-            self.assertEqual(gc.garmin_auth_status()["retry_after_seconds"], 1700)
-        self.assertEqual(gc.garmin_auth_status()["last_failure_stage"], "oauth2_refresh")
-
-    def test_safe_diagnostics_expose_expiry_but_not_credentials(self):
-        gc._write_tokens_from_env_to_disk()
-        status = gc.garmin_auth_status()
-        self.assertEqual(status["access_token_expires_at"], self.oauth2["expires_at"])
-        self.assertFalse(status["access_token_expired"])
-        self.assertNotIn("test-refresh", json.dumps(status))
-
-    def test_invalid_or_partial_env_does_not_use_password(self):
-        for value in ("", "not-base64", self.encode(["wrong shape"])):
-            os.environ["OAUTH2_B64"] = value
-            with patch.object(gc, "_login_client_with_credentials") as password:
+    def test_revoked_refresh_stops_until_relinked(self):
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(400)) as post:
+            with self.assertRaises(HTTPException):
+                self.manager.ensure_session()
+            with patch.object(auth.time, "time", return_value=self.now + 999999):
                 with self.assertRaises(HTTPException):
-                    gc._get_garmin_client()
-                password.assert_not_called()
+                    self.manager.ensure_session()
+        post.assert_called_once()
+        self.assertTrue(self.manager.status()["reauthentication_required"])
 
-    def test_debug_env_is_protected_and_makes_no_garmin_request(self):
+    def test_commit_failure_retries_storage_not_garmin(self):
+        self.store.fail_commit = True
+        renewed = tokens(marker="rotation")
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(renewed=renewed)) as post:
+            with self.assertRaises(TokenStoreError):
+                self.manager.ensure_session()
+            self.manager.ensure_session()
+        post.assert_called_once()
+        self.assertEqual(self.store.record["tokens"], renewed)
+
+    def test_newer_remote_session_is_not_overwritten_by_pending_save(self):
+        self.store.fail_commit = True
+        with patch.object(self.manager._client.client.cs, "post", return_value=response()):
+            with self.assertRaises(TokenStoreError):
+                self.manager.ensure_session()
+        newer = tokens(marker="other-process")
+        self.store.record["tokens"] = newer
+        self.manager.ensure_session()
+        self.assertEqual(self.store.record["tokens"], newer)
+
+    def test_bad_or_missing_tokens_never_trigger_password_login(self):
+        for invalid in (None, {}, {"di_token": "not-json"}, tokens(float("inf")), tokens(True)):
+            self.store.record["tokens"] = invalid
+            with self.assertRaises(HTTPException):
+                self.manager.ensure_session()
+
+    def test_invalid_renewal_is_paused(self):
+        invalid = tokens(self.now - 600)
+        with patch.object(self.manager._client.client.cs, "post", return_value=response(renewed=invalid)) as post:
+            for _ in range(2):
+                with self.assertRaises(HTTPException):
+                    self.manager.ensure_session()
+        post.assert_called_once()
+
+    def test_api_rate_limit_is_durable(self):
+        self.store.record["tokens"] = tokens()
+        self.manager.ensure_session()
+        hook = self.manager._client.client._api_session.hooks["response"][0]
+        with self.assertRaises(HTTPException):
+            hook(response(429, "3600"))
+        with self.assertRaises(HTTPException):
+            auth.SessionManager(self.store).ensure_session()
+        self.assertEqual(self.store.record["failure"]["stage"], "garmin_api")
+
+    def test_repeated_unauthorized_api_response_requires_relink(self):
+        self.store.record["tokens"] = tokens()
+        hook = self.manager._client.client._api_session.hooks["response"][0]
+        hook(response(401))
+        with self.assertRaises(HTTPException):
+            hook(response(401))
+        self.assertTrue(self.store.record["failure"]["reauthentication_required"])
+
+    def test_profile_is_loaded_only_once_without_library_login(self):
+        self.store.record["tokens"] = tokens()
+        with patch.object(self.manager._client, "connectapi", return_value={"displayName": "test", "fullName": "Test"}) as get:
+            self.manager.get_client()
+            self.manager.get_client()
+        get.assert_called_once_with("/userprofile-service/socialProfile")
+
+    def test_status_is_safe_and_does_not_contact_garmin(self):
+        result = self.manager.status()
+        self.assertEqual(result["auth_backend"], "garmin_di")
+        self.assertTrue(result["access_token_expired"])
+        self.assertNotIn("refresh-initial", json.dumps(result))
+        self.assertFalse(result["password_login_attempted"])
+
+    def test_storage_outage_fails_closed(self):
+        with patch.object(self.store, "locked", side_effect=TokenStoreError("Unavailable")):
+            with self.assertRaises(HTTPException) as caught:
+                auth.get_garmin_client()
+        self.assertEqual(caught.exception.status_code, 503)
+
+    def test_routes_remain_protected(self):
         client = TestClient(app)
+        self.assertEqual(client.get("/health").json(), {"ok": True})
+        self.assertEqual(client.get("/version").json(), {"version": "1.1.0"})
         self.assertEqual(client.get("/debug_env").status_code, 401)
+        self.assertEqual(client.get("/daily_summary?date=2026-09-11").status_code, 401)
         result = client.get("/debug_env", headers={"Authorization": "Bearer test-key"})
         self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.json()["garmin_auth"]["retry_after_seconds"], 0)
-        self.assertNotIn("test-access", result.text)
-        self.assertEqual(client.get("/version").json(), {"version": "1.0.2"})
+        self.assertTrue(result.json()["garmin_auth"]["token_store_available"])
+        self.assertNotIn("refresh-initial", result.text)
+
+    def test_all_data_routes_preserve_auth_pause_and_retry_after(self):
+        paused = HTTPException(503, "Garmin is paused", headers={"Retry-After": "1800"})
+        with patch.object(data, "_get_garmin_client", side_effect=paused), \
+                patch("app.main._get_garmin_client", side_effect=paused):
+            client = TestClient(app)
+            for url in ("/daily_summary?date=2026-09-11", "/sleep_summary?day=2026-09-11",
+                        "/debug_sleep?day=2026-09-11", "/sleep_range?start=2026-09-11&end=2026-09-12",
+                        "/activities?start=2026-09-11&end=2026-09-12"):
+                result = client.get(url, headers={"Authorization": "Bearer test-key"})
+                self.assertEqual(result.status_code, 503, url)
+                self.assertEqual(result.headers["Retry-After"], "1800", url)
+
+    def test_pause_during_optional_sleep_fetch_is_not_swallowed(self):
+        client = Mock()
+        client.get_stats_and_body.return_value = {"restingHeartRate": 54}
+        client.get_sleep_data.side_effect = HTTPException(503, "Paused", headers={"Retry-After": "1800"})
+        with patch.object(data, "_get_garmin_client", return_value=client):
+            result = TestClient(app).get("/daily_summary?date=2026-09-11", headers={"Authorization": "Bearer test-key"})
+        self.assertEqual(result.status_code, 503)
+
+    def test_existing_longer_cooldown_is_not_shortened(self):
+        self.store.record["failure"] = {"stage": "garmin_api", "http_status": 429, "retry_at": self.now + 7200}
+        hook = self.manager._client.client._api_session.hooks["response"][0]
+        with self.assertRaises(HTTPException):
+            hook(response(429, "30"))
+        self.assertGreaterEqual(self.manager.status()["retry_after_seconds"], 7199)
+
+    def test_pool_settings_are_applied_inside_transaction(self):
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = None
+        connection.__enter__.return_value = connection
+        store = TokenStore("unused", Fernet.generate_key().decode())
+        with patch("app.token_store.psycopg.connect", return_value=connection) as connect:
+            with store.locked():
+                pass
+        self.assertNotIn("options", connect.call_args.kwargs)
+        self.assertEqual(connect.call_args.kwargs["sslmode"], "verify-full")
+        queries = [call.args[0] for call in connection.execute.call_args_list]
+        self.assertTrue(any("SET LOCAL lock_timeout" in query for query in queries))
+        self.assertTrue(any("pg_advisory_xact_lock" in query for query in queries))
+
+    def test_daily_summary_contract_is_unchanged(self):
+        client = Mock()
+        client.get_stats_and_body.return_value = {"restingHeartRate": 54}
+        client.get_sleep_data.return_value = {}
+        with patch.object(data, "_get_garmin_client", return_value=client):
+            result = TestClient(app).get("/daily_summary?date=2026-09-11",
+                                        headers={"Authorization": "Bearer test-key"})
+        self.assertEqual(result.json(), {"date": "2026-09-11", "steps": None, "calories": None,
+                                         "restingHr": 54.0, "hrv": None})
+
+    def test_ciphertext_hides_tokens_and_requires_correct_key(self):
+        store = TokenStore("unused", Fernet.generate_key().decode())
+        encoded = store.encode(self.store.record)
+        self.assertNotIn("refresh-initial", encoded)
+        self.assertNotIn("test-client", encoded)
+        self.assertEqual(store.decode(encoded), self.store.record)
+        other = TokenStore("unused", Fernet.generate_key().decode())
+        with self.assertRaises(InvalidToken):
+            other.decode(encoded)
+
+    def test_encryption_and_database_config_are_required(self):
+        with self.assertRaises(TokenStoreError):
+            TokenStore.from_env()
+        with self.assertRaises(TokenStoreError):
+            TokenStore("unused", "invalid")
 
 
 if __name__ == "__main__":
